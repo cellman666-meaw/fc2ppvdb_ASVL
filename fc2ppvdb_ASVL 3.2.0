@@ -1,0 +1,459 @@
+// ==UserScript==
+// @name         FC2PPVDB 自動搜尋並添加鏈接 (選單OO版)
+// @namespace    fc2ppvdb_ASVL
+// @version      3.2.0
+// @description  自動搜尋多個網站，並在頁面左側添加可拖動的選單，控制哪些網站參與搜索（使用OO設計方法）。支援無限捲動與SPA換頁。
+// @author       jjbigjj
+// @match        *://*.fc2ppvdb.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM.setValue
+// @grant        GM.getValue
+// @run-at       document-end
+// @connect      123av.com
+// @connect      missav.ws
+// @connect      7mmtv.sx
+// @connect      javfc2.xyz
+// @connect      sukebei.nyaa.si
+// @connect      supjav.com
+// @connect      3xplanet.com
+// @connect      bt4gprx.com
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─────────────────────────────────────────────
+    // FloatingMenu
+    // ─────────────────────────────────────────────
+    class FloatingMenu {
+        constructor(titleText) {
+            this.menu    = null;
+            this.title   = null;
+            this.content = null;
+            this.isDragging = false;
+            this.offsetX = 0;
+            this.offsetY = 0;
+            this.createMenu(titleText);
+        }
+
+        createMenu(titleText) {
+            this.menu = document.createElement("div");
+            this.menu.id = "floating-menu";
+            Object.assign(this.menu.style, {
+                position:        "fixed",
+                top:             "50%",
+                left:            "0",
+                transform:       "translateY(-50%)",
+                width:           "200px",
+                backgroundColor: "rgba(0, 0, 0, 0.8)",
+                color:           "white",
+                padding:         "10px",
+                borderRadius:    "0 10px 10px 0",
+                zIndex:          "10000",
+                cursor:          "grab",
+                boxShadow:       "0 4px 8px rgba(0, 0, 0, 0.2)",
+            });
+            document.body.appendChild(this.menu);
+
+            this.title = document.createElement("div");
+            this.title.textContent = titleText;
+            Object.assign(this.title.style, {
+                fontWeight:   "bold",
+                marginBottom: "10px",
+                cursor:       "pointer",
+                textAlign:    "center",
+            });
+            this.menu.appendChild(this.title);
+
+            this.content = document.createElement("div");
+            this.content.style.display = "none";
+            this.menu.appendChild(this.content);
+
+            this._bindEvents();
+        }
+
+        _bindEvents() {
+            this.title.addEventListener("click", () => {
+                this.content.style.display =
+                    this.content.style.display === "none" ? "block" : "none";
+            });
+
+            this.menu.addEventListener("mousedown", (e) => {
+                this.isDragging = true;
+                this.offsetX = e.clientX - this.menu.getBoundingClientRect().left;
+                this.offsetY = e.clientY - this.menu.getBoundingClientRect().top;
+                this.menu.style.cursor = "grabbing";
+            });
+
+            document.addEventListener("mousemove", (e) => {
+                if (!this.isDragging) return;
+                this.menu.style.left      = `${e.clientX - this.offsetX}px`;
+                this.menu.style.top       = `${e.clientY - this.offsetY}px`;
+                this.menu.style.transform = "none";
+            });
+
+            document.addEventListener("mouseup", () => {
+                this.isDragging = false;
+                this.menu.style.cursor = "grab";
+            });
+        }
+
+        addContent(element) {
+            this.content.appendChild(element);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Site
+    // ─────────────────────────────────────────────
+    class Site {
+        constructor(name, searchUrlFunc, responseHandler, buttonColor,
+                    queryInterval = 1, maxConcurrentSearches = 3) {
+            this.name                  = name;
+            this.searchUrlFunc         = searchUrlFunc;
+            this.responseHandler       = responseHandler;
+            this.buttonColor           = buttonColor;
+            this.queryInterval         = queryInterval;
+            this.maxConcurrentSearches = maxConcurrentSearches;
+            this.queue                 = [];
+            this.isSearching           = 0;
+        }
+
+        addToQueue(id, element) {
+            this.queue.push({ id, element });
+            if (this.isSearching < this.maxConcurrentSearches) {
+                this.processQueue();
+            }
+        }
+
+        async processQueue() {
+            while (this.queue.length > 0 &&
+                   this.isSearching < this.maxConcurrentSearches) {
+                const { id, element } = this.queue.shift();
+                this.isSearching++;
+                try {
+                    await this.search(id, element);
+                } finally {
+                    this.isSearching--;
+                    await new Promise(r => setTimeout(r, this.queryInterval));
+                }
+            }
+        }
+
+        async search(id, element) {
+            const cacheKey     = `${this.name}_${id}`;
+            const cachedResult = await Utils.getCachedResult(cacheKey);
+            if (cachedResult) {
+                if (cachedResult.url) this.addButton(element, cachedResult.url);
+                return;
+            }
+
+            const searchUrl      = this.searchUrlFunc(id);
+            const loadingElement = Utils.showLoading(element, this.name);
+
+            new Promise(() => {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url:    searchUrl,
+                    onload: (response) => {
+                        let previewData = { url: '' };
+                        this.responseHandler(response, id, previewData);
+                        if (previewData.url) this.addButton(element, previewData.url);
+                        Utils.removeLoading(loadingElement);
+                        Utils.cacheResult(cacheKey, previewData);
+                    },
+                    onerror: () => {
+                        Utils.removeLoading(loadingElement);
+                        console.error(`${this.name} 搜尋失敗`);
+                    },
+                });
+            });
+        }
+
+        addButton(element, url) {
+            // Guard: parent chain อาจถูก remove ใน SPA แล้วก็ได้
+            const container = element?.parentElement?.parentElement;
+            if (!container) return;
+            const button = Utils.createButton(url, this.name, this.buttonColor);
+            container.appendChild(button);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // SearchManager  ← จุดหลักที่เพิ่มใหม่
+    // ─────────────────────────────────────────────
+    class SearchManager {
+        constructor() {
+            this.sites      = [];
+            this.seenIds    = new Set(); // ป้องกันค้นซ้ำ
+            this._observer  = null;
+            this._lastUrl   = location.href;
+        }
+
+        addSite(site) {
+            this.sites.push(site);
+        }
+
+        // ── เริ่มค้นและตั้ง observer ──────────────
+        async start() {
+            await this.scanPage();
+            this._watchDOM();
+            this._watchSPA();
+        }
+
+        // ── สแกน element ที่ยังไม่ถูกค้น ────────────
+        async scanPage() {
+            const elements    = document.querySelectorAll(
+                "span.absolute.top-0.left-0:not([data-searched])"
+            );
+            if (!elements.length) return;
+
+            const activeSites = await this.getActiveSites();
+            elements.forEach(element => {
+                const id = element.textContent.trim();
+                if (!id) return;
+
+                // ทำเครื่องหมายว่าค้นแล้ว (บน DOM)
+                element.setAttribute("data-searched", "1");
+
+                this.sites.forEach(site => {
+                    if (activeSites[site.name]) {
+                        site.addToQueue(id, element);
+                    }
+                });
+            });
+        }
+
+        // ── MutationObserver: คอย watch การเพิ่ม node ใหม่ (infinite scroll) ──
+        _watchDOM() {
+            if (this._observer) return;
+
+            let debounceTimer = null;
+            this._observer = new MutationObserver(() => {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => this.scanPage(), 400);
+            });
+
+            this._observer.observe(document.body, {
+                childList: true,
+                subtree:   true,
+            });
+        }
+
+        // ── SPA navigation: คอย watch URL เปลี่ยน (History API + hashchange) ──
+        _watchSPA() {
+            const checkUrl = () => {
+                if (location.href !== this._lastUrl) {
+                    this._lastUrl = location.href;
+                    // Reset seenIds เมื่อเปลี่ยนหน้า
+                    this.seenIds.clear();
+                    // รอ DOM render เสร็จก่อน scan
+                    setTimeout(() => this.scanPage(), 800);
+                }
+            };
+
+            // intercept pushState / replaceState
+            const _push    = history.pushState.bind(history);
+            const _replace = history.replaceState.bind(history);
+            history.pushState = function (...args) {
+                _push(...args);
+                checkUrl();
+            };
+            history.replaceState = function (...args) {
+                _replace(...args);
+                checkUrl();
+            };
+
+            window.addEventListener("popstate",   checkUrl);
+            window.addEventListener("hashchange", checkUrl);
+        }
+
+        async getActiveSites() {
+            const activeSites = {};
+            for (const site of this.sites) {
+                activeSites[site.name] = await GM.getValue(`site_${site.name}`, true);
+            }
+            return activeSites;
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Utils
+    // ─────────────────────────────────────────────
+    class Utils {
+        static showLoading(element, siteName) {
+            const el = document.createElement("span");
+            el.textContent = `搵緊 ${siteName}...`;
+            el.className   = "inline-block text-gray-500 ml-2";
+            element?.parentElement?.parentElement?.appendChild(el);
+            return el;
+        }
+
+        static removeLoading(el) {
+            if (el) el.remove();
+        }
+
+        static createButton(url, text, bgColorClass) {
+            const a      = document.createElement("a");
+            a.href        = url;
+            a.textContent = text;
+            a.className   = `inline-block ${bgColorClass} text-white px-2 py-1 rounded mt-2 ml-2`;
+            a.target      = "_blank";
+            return a;
+        }
+
+        static async cacheResult(key, data, expiryHours = 12) {
+            const expiry    = Date.now() + expiryHours * 3_600_000;
+            await GM.setValue(key, { data, expiry });
+        }
+
+        static async getCachedResult(key) {
+            const cached = await GM.getValue(key, null);
+            if (!cached) return null;
+            if (cached.expiry < Date.now()) {
+                await GM.setValue(key, null);
+                return null;
+            }
+            return cached.data;
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Bootstrap
+    // ─────────────────────────────────────────────
+    const manager = new SearchManager();
+
+    manager.addSite(new Site(
+        '_123av',
+        id => `https://123av.com/zh/search?keyword=${id}`,
+        (response, id, previewData) => {
+            const doc        = new DOMParser().parseFromString(response.responseText, "text/html");
+            const videoCount = doc.querySelector(".text-muted")?.textContent.trim();
+            if (videoCount && videoCount !== "0 视频")
+                previewData.url = `https://123av.com/zh/search?keyword=${id}`;
+        },
+        'bg-blue-500'
+    ));
+
+    manager.addSite(new Site(
+        'MissAV',
+        id => `https://missav.ws/search/${id}`,
+        (response, id, previewData) => {
+            const doc          = new DOMParser().parseFromString(response.responseText, "text/html");
+            const matchingLink = Array.from(doc.querySelectorAll('a[alt]')).find(a => {
+                const alt  = a.getAttribute('alt').toLowerCase();
+                const text = a.textContent.toLowerCase();
+                return alt.includes(id.toLowerCase()) && text.includes(id.toLowerCase());
+            });
+            if (matchingLink) previewData.url = `https://missav.ws/search/${id}`;
+        },
+        'bg-green-500'
+    ));
+
+    manager.addSite(new Site(
+        '7MMTV',
+        id => `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(id)}&search_type=searchall&op=search`,
+        (response, id, previewData) => {
+            const match = response.responseText.match(new RegExp(`搜索 "${id}" \\((\\d+)\\)`));
+            if (match && parseInt(match[1]) > 0)
+                previewData.url = `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(id)}`;
+        },
+        'bg-red-500'
+    ));
+
+    manager.addSite(new Site(
+        'JAVFC2',
+        id => `https://javfc2.xyz/search?q=${id}`,
+        (response, id, previewData) => {
+            const doc         = new DOMParser().parseFromString(response.responseText, "text/html");
+            const nothingFound = Array.from(doc.querySelectorAll('h4'))
+                .find(h4 => h4.textContent.includes("Nothing found by"));
+            if (!nothingFound) previewData.url = `https://javfc2.xyz/search?q=${id}`;
+        },
+        'bg-purple-500'
+    ));
+
+    manager.addSite(new Site(
+        'Sukebei',
+        id => `https://sukebei.nyaa.si/?page=rss&q=${encodeURIComponent(id)}&c=0_0&f=0`,
+        (response, id, previewData) => {
+            const doc   = new DOMParser().parseFromString(response.responseText, "text/xml");
+            const items = doc.querySelectorAll("item");
+            if (items.length > 0)
+                previewData.url = `https://sukebei.nyaa.si/?f=0&c=0_0&q=${encodeURIComponent(id)}&s=seeders&o=desc`;
+        },
+        'bg-yellow-500',
+        1000
+    ));
+
+    manager.addSite(new Site(
+        'SupJav',
+        id => `https://supjav.com/?s=${id}`,
+        (response, id, previewData) => {
+            const doc  = new DOMParser().parseFromString(response.responseText, "text/html");
+            const h1   = doc.querySelector("h1");
+            if (h1 && h1.textContent.includes(`Search Result For: ${id}`)) {
+                const count = h1.textContent.match(/\((\d+)\)/);
+                if (count && parseInt(count[1]) > 0)
+                    previewData.url = `https://supjav.com/?s=${id}`;
+            }
+        },
+        'bg-orange-500'
+    ));
+
+    manager.addSite(new Site(
+        '3xplanet',
+        id => `https://3xplanet.com/?s=${id}`,
+        (response, id, previewData) => {
+            const doc     = new DOMParser().parseFromString(response.responseText, "text/html");
+            const noResult = doc.querySelector("h2");
+            if (!noResult || !noResult.textContent.includes("No results for your search"))
+                previewData.url = `https://3xplanet.com/?s=${id}`;
+        },
+        'bg-gray-500'
+    ));
+
+    manager.addSite(new Site(
+        'bt4gprx',
+        id => `https://bt4gprx.com/search?q=${id}&category=movie`,
+        (response, id, previewData) => {
+            const doc     = new DOMParser().parseFromString(response.responseText, "text/html");
+            const noResult = doc.querySelector("p");
+            if (!noResult || !noResult.textContent.includes("did not match any documents."))
+                previewData.url = `https://bt4gprx.com/search?q=${id}&category=movie`;
+        },
+        'bg-gray-500',
+        100
+    ));
+
+    // ── Floating Menu ────────────────────────────
+    const floatingMenu = new FloatingMenu("搜尋開關");
+
+    (async () => {
+        const activeSites = await manager.getActiveSites();
+        for (const site of manager.sites) {
+            const checkbox    = document.createElement("input");
+            checkbox.type     = "checkbox";
+            checkbox.id       = `checkbox_${site.name}`;
+            checkbox.checked  = activeSites[site.name];
+            checkbox.style.marginRight = "5px";
+            checkbox.addEventListener("change", async () => {
+                await GM.setValue(`site_${site.name}`, checkbox.checked);
+            });
+
+            const label     = document.createElement("label");
+            label.textContent = site.name;
+            label.htmlFor   = `checkbox_${site.name}`;
+            label.style.cursor = "pointer";
+
+            const container = document.createElement("div");
+            container.appendChild(checkbox);
+            container.appendChild(label);
+            floatingMenu.addContent(container);
+        }
+    })();
+
+    // ── Start ────────────────────────────────────
+    manager.start();
+
+})();
