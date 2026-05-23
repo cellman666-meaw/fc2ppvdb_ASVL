@@ -1,0 +1,848 @@
+// ==UserScript==
+// @name         FC2PPVDB 自動搜尋並添加鏈接
+// @namespace    fc2ppvdb_ASVL3.10
+// @version      3.10.0
+// @description  自動搜尋多個網站，並在頁面左側添加可拖動 Pre-Configured ของแต่ละเวบไซต์เพื่อป้องกัน Rate-Limit. 支援無限捲動與SPA換頁。 (Performance, UI & Throttle Optimized)
+// @author       jjbigjj, Antigravity
+// @match        *://*.fc2ppvdb.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM.setValue
+// @grant        GM.getValue
+// @run-at       document-end
+// @connect      123av.com
+// @connect      missav.ws
+// @connect      7mmtv.sx
+// @connect      javfc2.xyz
+// @connect      sukebei.nyaa.si
+// @connect      supjav.com
+// @connect      3xplanet.com
+// @connect      bt4gprx.com
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─────────────────────────────────────────────
+    // Styles Injection (Premium Glassmorphism & Animations)
+    // ─────────────────────────────────────────────
+    const style = document.createElement('style');
+    style.textContent = `
+        #floating-menu {
+            position: fixed;
+            top: 50%;
+            left: 0;
+            transform: translateY(-50%);
+            width: 220px;
+            background: rgba(15, 23, 42, 0.85) !important;
+            backdrop-filter: blur(12px) saturate(180%);
+            -webkit-backdrop-filter: blur(12px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.08) !important;
+            border-left: none !important;
+            color: #f8fafc !important;
+            padding: 16px !important;
+            border-radius: 0 16px 16px 0 !important;
+            z-index: 100000 !important;
+            box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5) !important;
+            font-family: system-ui, -apple-system, sans-serif !important;
+            transition: left 0.1s ease-out, top 0.1s ease-out, box-shadow 0.2s;
+            user-select: none;
+        }
+        
+        #floating-menu-title {
+            font-weight: 700;
+            font-size: 13px;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 12px;
+            cursor: grab;
+            text-align: center;
+            color: #60a5fa !important;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 8px;
+            transition: color 0.2s;
+        }
+        
+        #floating-menu-title:hover {
+            color: #93c5fd !important;
+        }
+
+        #floating-menu-content {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .menu-item {
+            display: flex;
+            align-items: center;
+            padding: 6px 8px;
+            border-radius: 8px;
+            transition: background-color 0.2s;
+            cursor: pointer;
+        }
+
+        .menu-item:hover {
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        .menu-item input[type="checkbox"] {
+            margin-right: 10px;
+            cursor: pointer;
+            accent-color: #3b82f6;
+            width: 14px;
+            height: 14px;
+        }
+
+        .menu-item label {
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            color: #e2e8f0;
+            flex-grow: 1;
+        }
+
+        /* Premium search buttons injected on target page */
+        .fc2ppvdb-search-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px !important;
+            font-weight: 600 !important;
+            color: #ffffff !important;
+            padding: 4px 8px !important;
+            border-radius: 6px !important;
+            margin-top: 6px !important;
+            margin-left: 6px !important;
+            text-decoration: none !important;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15) !important;
+            border: none !important;
+        }
+
+        .fc2ppvdb-search-btn:hover {
+            transform: translateY(-1px) !important;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.25) !important;
+            filter: brightness(1.15) !important;
+        }
+
+        .fc2ppvdb-loading {
+            display: inline-flex;
+            align-items: center;
+            font-size: 11px !important;
+            color: #94a3b8 !important;
+            margin-left: 8px !important;
+            font-style: italic;
+            animation: fc2pulse 1.5s infinite;
+        }
+
+        @keyframes fc2pulse {
+            0%, 100% { opacity: 0.6; }
+            50% { opacity: 1; }
+        }
+    `;
+    document.head.appendChild(style);
+
+    // ─────────────────────────────────────────────
+    // Helper Functions for Robust Parsing
+    // ─────────────────────────────────────────────
+    // Safely resolves relative links (e.g. "/post/123") to absolute URLs using the designated domain
+    function resolveAbsoluteUrl(href, domain) {
+        if (!href) return '';
+        if (href.startsWith('http')) return href;
+        const cleanHref = href.startsWith('/') ? href.substring(1) : href;
+        return `https://${domain}/${cleanHref}`;
+    }
+
+    // Strictly searches DOM for valid post links containing the exact ID.
+    // Compares elements using normalized alphanumeric lowercase to ignore hyphens, underscores, or spaces differences.
+    // Scans href, link text content, and image alt attributes to handle custom post slugs flawlessly.
+    function findDirectPostLink(doc, domain, id) {
+        const idLower = id.toLowerCase();
+        const cleanId = idLower.replace(/[^a-z0-9]/g, '');
+        if (!cleanId) return null;
+        
+        // Match standard WordPress and common video list card/post containers
+        const postSelectors = '.post, .posts, article, .entry-title, .video-card, .video-item, .thumb, .item, .torrent-list, .img, .post-img, .post-title, .title, .entry-header';
+        const postContainers = doc.querySelectorAll(postSelectors);
+        
+        // Limit query scope to post cards if found, otherwise scan the main body
+        const searchScope = postContainers.length > 0 ? Array.from(postContainers) : [doc.body];
+        
+        for (const container of searchScope) {
+            if (!container) continue;
+            const links = container.querySelectorAll('a');
+            for (const a of links) {
+                const href = (a.getAttribute('href') || '').toLowerCase();
+                
+                // Exclude system pages and common non-post links
+                if (!href || href === '#' || href === '/' || href.startsWith('javascript:') ||
+                    href.includes('?s=') || href.includes('keyword=') || href.includes('search') || 
+                    href.includes('/category/') || href.includes('/tag/') || href.includes('/page/') ||
+                    href.includes('/genre/')) {
+                    continue;
+                }
+                
+                // Fetch clean versions of URL, text content, and thumbnail alt attributes
+                const cleanHref = href.replace(/[^a-z0-9]/g, '');
+                const cleanText = a.textContent.toLowerCase().replace(/[^a-z0-9]/g, '');
+                const cleanAlt  = (a.querySelector('img')?.getAttribute('alt') || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+                
+                // Alphanumeric comparison ensures exact ID match independent of formatting (hyphens, underscores, spaces)
+                if (cleanHref.includes(cleanId) || cleanText.includes(cleanId) || cleanAlt.includes(cleanId)) {
+                    // Must belong to target domain OR be a relative path
+                    if (href.includes(domain) || href.startsWith('/') || href.startsWith('.')) {
+                        return a;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // ─────────────────────────────────────────────
+    // FloatingMenu
+    // ─────────────────────────────────────────────
+    class FloatingMenu {
+        constructor(titleText) {
+            this.menu       = null;
+            this.title      = null;
+            this.content    = null;
+            this.isDragging = false;
+            this.wasDragged = false;
+            this.offsetX    = 0;
+            this.offsetY    = 0;
+            this.createMenu(titleText);
+        }
+
+        createMenu(titleText) {
+            this.menu = document.createElement("div");
+            this.menu.id = "floating-menu";
+            document.body.appendChild(this.menu);
+
+            this.title = document.createElement("div");
+            this.title.id = "floating-menu-title";
+            this.title.innerHTML = `🔍 ${titleText}`;
+            this.menu.appendChild(this.title);
+
+            this.content = document.createElement("div");
+            this.content.id = "floating-menu-content";
+            this.content.style.display = "none";
+            this.menu.appendChild(this.content);
+
+            this._bindEvents();
+        }
+
+        _bindEvents() {
+            // Only toggle content if we did NOT drag the menu
+            this.title.addEventListener("click", () => {
+                if (this.wasDragged) return;
+                this.content.style.display =
+                    this.content.style.display === "none" ? "block" : "none";
+            });
+
+            // Restrict dragging to the title handle ONLY
+            this.title.addEventListener("mousedown", (e) => {
+                this.isDragging = true;
+                this.wasDragged = false;
+                this.offsetX = e.clientX - this.menu.getBoundingClientRect().left;
+                this.offsetY = e.clientY - this.menu.getBoundingClientRect().top;
+                this.title.style.cursor = "grabbing";
+                document.body.style.userSelect = "none";
+            });
+
+            document.addEventListener("mousemove", (e) => {
+                if (!this.isDragging) return;
+                this.wasDragged = true;
+                this.menu.style.left      = `${e.clientX - this.offsetX}px`;
+                this.menu.style.top       = `${e.clientY - this.offsetY}px`;
+                this.menu.style.transform = "none";
+            });
+
+            document.addEventListener("mouseup", () => {
+                if (this.isDragging) {
+                    this.isDragging = false;
+                    this.title.style.cursor = "grab";
+                    document.body.style.userSelect = "";
+                }
+            });
+        }
+
+        addContent(element) {
+            this.content.appendChild(element);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Site
+    // ─────────────────────────────────────────────
+    class Site {
+        constructor(name, searchUrlFunc, responseHandler, buttonColor,
+                    queryInterval = 800, maxConcurrentSearches = 2) {
+            this.name                  = name;
+            this.searchUrlFunc         = searchUrlFunc;
+            this.responseHandler       = responseHandler;
+            this.buttonColor           = buttonColor;
+            this.queryInterval         = queryInterval;
+            this.maxConcurrentSearches = maxConcurrentSearches;
+            this.queue                 = [];
+            this.isSearching           = 0;
+        }
+
+        addToQueue(id, element) {
+            this.queue.push({ id, element });
+            this.processQueue();
+        }
+
+        // Highly optimized concurrent execution queue using non-blocking asynchronous IIFE slots
+        processQueue() {
+            if (this.queue.length === 0 || this.isSearching >= this.maxConcurrentSearches) {
+                return;
+            }
+
+            const { id, element } = this.queue.shift();
+            this.isSearching++;
+
+            (async () => {
+                try {
+                    await this.search(id, element);
+                } catch (err) {
+                    console.error(`[${this.name}] Execution error:`, err);
+                } finally {
+                    this.isSearching--;
+                    // Sleep queryInterval before letting this concurrency slot handle the next item
+                    await new Promise(r => setTimeout(r, this.queryInterval));
+                    this.processQueue();
+                }
+            })();
+
+            // Recursively spawn next slot if capacity remains
+            this.processQueue();
+        }
+
+        async search(id, element) {
+            const cacheKey     = `${this.name}_${id}`;
+            const cachedResult = await Utils.getCachedResult(cacheKey);
+            if (cachedResult) {
+                if (cachedResult.url) this.addButton(element, cachedResult.url);
+                return;
+            }
+
+            // Deduplication (Cache Stampede Prevention): check for existing pending search
+            if (Utils.pendingSearches[cacheKey]) {
+                const resultUrl = await Utils.pendingSearches[cacheKey];
+                if (resultUrl) this.addButton(element, resultUrl);
+                return;
+            }
+
+            const searchUrl      = this.searchUrlFunc(id);
+            const loadingElement = Utils.showLoading(element, this.name);
+
+            // Correctly returning a functional Promise so queue controls actually block and throttle requests
+            const searchPromise = new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url:    searchUrl,
+                    timeout: 12000, // Safe 12s request timeout
+                    onload: (response) => {
+                        // Check if the response status is actually successful
+                        if (response.status !== 200) {
+                            Utils.removeLoading(loadingElement);
+                            console.error(`[${this.name}] Search failed with status ${response.status} (Possibly Rate Limited)`);
+                            // Cache temporary network failures or rate limits for only 3 mins (0.05 hrs)
+                            Utils.cacheResult(cacheKey, { url: '' }, 0.05);
+                            resolve('');
+                            return;
+                        }
+
+                        let previewData = { url: '' };
+                        try {
+                            this.responseHandler(response, id, previewData);
+                        } catch (err) {
+                            console.error(`[${this.name}] Error parsing response for ${id}:`, err);
+                        }
+                        if (previewData.url) this.addButton(element, previewData.url);
+                        Utils.removeLoading(loadingElement);
+                        
+                        // Cache successfully resolved URL for 24h, and verified zero-results for 12h
+                        Utils.cacheResult(cacheKey, previewData, previewData.url ? 24 : 12);
+                        resolve(previewData.url);
+                    },
+                    onerror: () => {
+                        Utils.removeLoading(loadingElement);
+                        console.error(`${this.name} 搜尋失敗`);
+                        Utils.cacheResult(cacheKey, { url: '' }, 0.05); // Cache for only 3 mins on network error
+                        resolve('');
+                    },
+                    ontimeout: () => {
+                        Utils.removeLoading(loadingElement);
+                        console.error(`${this.name} 搜尋超時`);
+                        Utils.cacheResult(cacheKey, { url: '' }, 0.05); // Cache for only 3 mins on timeout
+                        resolve('');
+                    }
+                });
+            });
+
+            Utils.pendingSearches[cacheKey] = searchPromise;
+
+            try {
+                await searchPromise;
+            } finally {
+                delete Utils.pendingSearches[cacheKey];
+            }
+        }
+
+        addButton(element, url) {
+            const container = element?.parentElement?.parentElement;
+            if (!container) return;
+            const button = Utils.createButton(url, this.name, this.buttonColor);
+            container.appendChild(button);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // SearchManager
+    // ─────────────────────────────────────────────
+    class SearchManager {
+        constructor() {
+            this.sites        = [];
+            this.seenIds      = new Set();
+            this._observer    = null;
+            this._lastUrl     = location.href;
+            this.activeSites  = {}; // High-performance local cache of site toggle states to prevent IPC overhead inside loops
+            this._spaTimer    = null;
+        }
+
+        addSite(site) {
+            this.sites.push(site);
+        }
+
+        // Initialize active site configurations in one single pass at startup
+        async refreshActiveSites() {
+            for (const site of this.sites) {
+                this.activeSites[site.name] = await GM.getValue(`site_${site.name}`, true);
+            }
+        }
+
+        async start() {
+            await this.refreshActiveSites();
+            await this.scanPage();
+            this._watchDOM();
+            this._watchSPA();
+        }
+
+        // Synchronous fast DOM scanning
+        scanPage() {
+            const elements = document.querySelectorAll(
+                "span.absolute.top-0.left-0:not([data-searched])"
+            );
+            if (!elements.length) return;
+
+            elements.forEach(element => {
+                const id = element.textContent.trim();
+                if (!id) return;
+
+                element.setAttribute("data-searched", "1");
+
+                this.sites.forEach(site => {
+                    if (this.activeSites[site.name]) {
+                        site.addToQueue(id, element);
+                    }
+                });
+            });
+        }
+
+        _watchDOM() {
+            if (this._observer) return;
+
+            let debounceTimer = null;
+            this._observer = new MutationObserver((mutations) => {
+                // High-performance filter: only scan if elements are actually added
+                const hasAddedNodes = mutations.some(m => m.addedNodes.length > 0);
+                if (!hasAddedNodes) return;
+
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => this.scanPage(), 250); // Fast 250ms debounce
+            });
+
+            this._observer.observe(document.body, {
+                childList: true,
+                subtree:   true,
+            });
+        }
+
+        _watchSPA() {
+            const checkUrl = () => {
+                if (location.href !== this._lastUrl) {
+                    this._lastUrl = location.href;
+                    this.seenIds.clear();
+                    
+                    // Clear any pending SPA scans
+                    if (this._spaTimer) clearTimeout(this._spaTimer);
+                    this._spaTimer = setTimeout(() => this.scanPage(), 600);
+                }
+            };
+
+            const _push    = history.pushState.bind(history);
+            const _replace = history.replaceState.bind(history);
+            history.pushState = function (...args) {
+                _push(...args);
+                checkUrl();
+            };
+            history.replaceState = function (...args) {
+                _replace(...args);
+                checkUrl();
+            };
+
+            window.addEventListener("popstate",   checkUrl);
+            window.addEventListener("hashchange", checkUrl);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Utils
+    // ─────────────────────────────────────────────
+    class Utils {
+        // High-performance memory caches
+        static sessionCache = {};
+        static pendingSearches = {};
+
+        static showLoading(element, siteName) {
+            const el = document.createElement("span");
+            el.textContent = `🔍 [${siteName}]...`;
+            el.className   = "fc2ppvdb-loading";
+            element?.parentElement?.parentElement?.appendChild(el);
+            return el;
+        }
+
+        static removeLoading(el) {
+            if (el) el.remove();
+        }
+
+        static createButton(url, text, bgColorClass) {
+            const a = document.createElement("a");
+            a.href = url;
+            a.textContent = text;
+            a.className = "fc2ppvdb-search-btn";
+            
+            // Map legacy tailwind colors to custom premium hex values
+            const colorMap = {
+                'bg-blue-500': '#3b82f6',
+                'bg-green-500': '#10b981',
+                'bg-red-500': '#ef4444',
+                'bg-purple-500': '#8b5cf6',
+                'bg-yellow-500': '#eab308',
+                'bg-orange-500': '#f97316',
+                'bg-gray-500': '#64748b'
+            };
+            a.style.backgroundColor = colorMap[bgColorClass] || '#6366f1';
+            a.target = "_blank";
+            return a;
+        }
+
+        static async cacheResult(key, data, expiryHours = 12) {
+            const expiry = Date.now() + expiryHours * 3_600_000;
+            this.sessionCache[key] = data; // Cache to local memory immediately
+            await GM.setValue(key, { data, expiry });
+        }
+
+        static async getCachedResult(key) {
+            // Instant lookup from memory cache first
+            if (this.sessionCache[key] !== undefined) {
+                return this.sessionCache[key];
+            }
+            
+            const cached = await GM.getValue(key, null);
+            if (!cached) {
+                this.sessionCache[key] = null;
+                return null;
+            }
+            if (cached.expiry < Date.now()) {
+                await GM.setValue(key, null);
+                this.sessionCache[key] = null;
+                return null;
+            }
+            this.sessionCache[key] = cached.data;
+            return cached.data;
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Bootstrap & Site Declarations
+    // ─────────────────────────────────────────────
+    const manager = new SearchManager();
+
+    manager.addSite(new Site(
+        '_123av',
+        id => `https://123av.com/zh/search?keyword=${id.replace(/[^0-9]/g, '') || id}`,
+        (response, id, previewData) => {
+            const doc      = new DOMParser().parseFromString(response.responseText, "text/html");
+            const idLower  = id.toLowerCase();
+            const cleanId  = idLower.replace(/[^a-z0-9]/g, '');
+            
+            // 1. Direct post link check
+            const matchingLink = findDirectPostLink(doc, '123av.com', id);
+            if (matchingLink) {
+                previewData.url = resolveAbsoluteUrl(matchingLink.getAttribute('href'), '123av.com');
+                return;
+            }
+            
+            // 2. Video count check
+            const videoCount = doc.querySelector(".text-muted")?.textContent.trim();
+            if (videoCount && videoCount !== "0 视频") {
+                previewData.url = `https://123av.com/zh/search?keyword=${id.replace(/[^0-9]/g, '') || id}`;
+                return;
+            }
+            
+            // 3. Final URL check
+            if (response.finalUrl) {
+                const cleanFinal = response.finalUrl.toLowerCase().replace(/[^a-z0-9]/g, '');
+                if (cleanFinal.includes(cleanId) && !response.finalUrl.includes('search')) {
+                    previewData.url = response.finalUrl;
+                }
+            }
+        },
+        'bg-blue-500',
+        800,
+        2
+    ));
+
+    manager.addSite(new Site(
+        'MissAV',
+        id => `https://missav.ws/search/${id.replace(/[^0-9]/g, '') || id}`,
+        (response, id, previewData) => {
+            const doc     = new DOMParser().parseFromString(response.responseText, "text/html");
+            const idLower = id.toLowerCase();
+            const cleanId = idLower.replace(/[^a-z0-9]/g, '');
+            
+            // Match any link that has href or alt containing the ID (prevents empty textContent bug)
+            const matchingLink = Array.from(doc.querySelectorAll('a')).find(a => {
+                const href = (a.getAttribute('href') || '').toLowerCase();
+                const alt  = (a.getAttribute('alt') || '').toLowerCase();
+                
+                const cleanHref = href.replace(/[^a-z0-9]/g, '');
+                const cleanAlt  = alt.replace(/[^a-z0-9]/g, '');
+                
+                return (cleanHref.includes(cleanId) || cleanAlt.includes(cleanId)) && !href.includes('/search');
+            });
+            
+            if (matchingLink) {
+                previewData.url = resolveAbsoluteUrl(matchingLink.getAttribute('href'), 'missav.ws');
+                return;
+            }
+            
+            if (response.finalUrl) {
+                const cleanFinal = response.finalUrl.toLowerCase().replace(/[^a-z0-9]/g, '');
+                if (cleanFinal.includes(cleanId) && !response.finalUrl.includes('/search')) {
+                    previewData.url = response.finalUrl;
+                }
+            }
+        },
+        'bg-green-500',
+        800,
+        2
+    ));
+
+    manager.addSite(new Site(
+        '7MMTV',
+        id => `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(id.replace(/[^0-9]/g, '') || id)}&search_type=searchall&op=search`,
+        (response, id, previewData) => {
+            const cleanNum = id.replace(/[^0-9]/g, '') || id;
+            const escapedId = cleanNum.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Safety Regex Escape
+            const match = response.responseText.match(new RegExp(`搜索 "${escapedId}" \\((\\d+)\\)`));
+            if (match && parseInt(match[1]) > 0) {
+                previewData.url = `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(cleanNum)}`;
+                return;
+            }
+            
+            // Fallback: Check if there's an exact video link
+            const doc = new DOMParser().parseFromString(response.responseText, "text/html");
+            const matchingLink = findDirectPostLink(doc, '7mmtv.sx', id);
+            if (matchingLink) {
+                previewData.url = resolveAbsoluteUrl(matchingLink.getAttribute('href'), '7mmtv.sx');
+            }
+        },
+        'bg-red-500',
+        800,
+        2
+    ));
+
+    manager.addSite(new Site(
+        'JAVFC2',
+        id => `https://javfc2.xyz/search?q=${id.replace(/[^0-9]/g, '') || id}`,
+        (response, id, previewData) => {
+            const doc     = new DOMParser().parseFromString(response.responseText, "text/html");
+            
+            // 1. Direct link check
+            const matchingLink = findDirectPostLink(doc, 'javfc2.xyz', id);
+            if (matchingLink) {
+                previewData.url = resolveAbsoluteUrl(matchingLink.getAttribute('href'), 'javfc2.xyz');
+                return;
+            }
+            
+            // 2. Fallback check for absence of "Nothing found"
+            const nothingFound = Array.from(doc.querySelectorAll('h4'))
+                .find(h4 => h4.textContent.includes("Nothing found by"));
+            if (!nothingFound) {
+                previewData.url = `https://javfc2.xyz/search?q=${id.replace(/[^0-9]/g, '') || id}`;
+            }
+        },
+        'bg-purple-500',
+        800,
+        2
+    ));
+
+    manager.addSite(new Site(
+        'Sukebei',
+        id => `https://sukebei.nyaa.si/?page=rss&q=${encodeURIComponent(id.replace(/[^0-9]/g, '') || id)}&c=0_0&f=0`,
+        (response, id, previewData) => {
+            const doc   = new DOMParser().parseFromString(response.responseText, "text/xml");
+            const items = doc.querySelectorAll("item");
+            if (items.length > 0)
+                previewData.url = `https://sukebei.nyaa.si/?f=0&c=0_0&q=${encodeURIComponent(id.replace(/[^0-9]/g, '') || id)}&s=seeders&o=desc`;
+        },
+        'bg-yellow-500',
+        1500,
+        1
+    ));
+
+    manager.addSite(new Site(
+        'SupJav',
+        id => `https://supjav.com/?s=${id.replace(/[^0-9]/g, '') || id}`,
+        (response, id, previewData) => {
+            const doc = new DOMParser().parseFromString(response.responseText, "text/html");
+            const idLower = id.toLowerCase();
+            const cleanId = idLower.replace(/[^a-z0-9]/g, '');
+            
+            // Method 1: Look for any direct article/post link containing the exact ID inside a post container (highly robust layout matching)
+            const matchingLink = findDirectPostLink(doc, 'supjav.com', id);
+            if (matchingLink) {
+                previewData.url = resolveAbsoluteUrl(matchingLink.getAttribute('href'), 'supjav.com');
+                return;
+            }
+            
+            // Method 2: Case-insensitive search results header check with alphanumeric cleaning to ignore hyphens/spaces
+            // Supports multiple heading levels (H1, H2, H3, and titles) for extreme theme resilience
+            const heading = doc.querySelector("h1, h2, h3, .page-title, .page-header, .archive-title");
+            if (heading) {
+                const cleanHeadingText = heading.textContent.toLowerCase().replace(/[^a-z0-9]/g, '');
+                if (cleanHeadingText.includes("searchresultfor") && cleanHeadingText.includes(cleanId)) {
+                    const countMatch = heading.textContent.match(/\((\d+)\)/);
+                    if (countMatch && parseInt(countMatch[1]) > 0) {
+                        previewData.url = `https://supjav.com/?s=${id.replace(/[^0-9]/g, '') || id}`;
+                        return;
+                    }
+                }
+            }
+            
+            // Method 3: Final redirected URL detection
+            if (response.finalUrl) {
+                const cleanFinalUrl = response.finalUrl.toLowerCase().replace(/[^a-z0-9]/g, '');
+                if (cleanFinalUrl.includes(cleanId) && !response.finalUrl.includes('?s=')) {
+                    previewData.url = response.finalUrl;
+                    return;
+                }
+            }
+            
+            // Method 4: Generic body text check fallback
+            const pageText = doc.body ? doc.body.textContent.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+            if (pageText.includes(cleanId) && doc.querySelector('.post, .posts, article, .img')) {
+                previewData.url = `https://supjav.com/?s=${id.replace(/[^0-9]/g, '') || id}`;
+            }
+        },
+        'bg-orange-500',
+        1200, // 1.2s delay to prevent SupJav Cloudflare/WAF block
+        1     // Strict sequential searches to prevent rate limit (HTTP 429)
+    ));
+
+    manager.addSite(new Site(
+        '3xplanet',
+        id => `https://3xplanet.com/?s=${id.replace(/[^0-9]/g, '') || id}`,
+        (response, id, previewData) => {
+            const doc     = new DOMParser().parseFromString(response.responseText, "text/html");
+            
+            // 1. Direct link check
+            const matchingLink = findDirectPostLink(doc, '3xplanet.com', id);
+            if (matchingLink) {
+                previewData.url = resolveAbsoluteUrl(matchingLink.getAttribute('href'), '3xplanet.com');
+                return;
+            }
+            
+            // 2. Fallback check for "No results" absence
+            const noResult = doc.querySelector("h2");
+            if (!noResult || !noResult.textContent.includes("No results for your search")) {
+                previewData.url = `https://3xplanet.com/?s=${id.replace(/[^0-9]/g, '') || id}`;
+            }
+        },
+        'bg-gray-500',
+        800,
+        2
+    ));
+
+    manager.addSite(new Site(
+        'bt4gprx',
+        id => `https://bt4gprx.com/search?q=${id.replace(/[^0-9]/g, '') || id}&category=movie`,
+        (response, id, previewData) => {
+            const doc     = new DOMParser().parseFromString(response.responseText, "text/html");
+            const idLower = id.toLowerCase();
+            const cleanId = idLower.replace(/[^a-z0-9]/g, '');
+            
+            // 1. Direct link check
+            const matchingLink = Array.from(doc.querySelectorAll('a')).find(a => {
+                const href = (a.getAttribute('href') || '').toLowerCase();
+                const cleanHref = href.replace(/[^a-z0-9]/g, '');
+                return href.includes('/magnet/') && cleanHref.includes(cleanId);
+            });
+            if (matchingLink) {
+                previewData.url = `https://bt4gprx.com/search?q=${id.replace(/[^0-9]/g, '') || id}&category=movie`;
+                return;
+            }
+            
+            // 2. Fallback check
+            const noResult = doc.querySelector("p");
+            if (!noResult || !noResult.textContent.includes("did not match any documents.")) {
+                previewData.url = `https://bt4gprx.com/search?q=${id.replace(/[^0-9]/g, '') || id}&category=movie`;
+            }
+        },
+        'bg-gray-500',
+        600,
+        2
+    ));
+
+    // ── Floating Menu Setup ──────────────────────
+    const floatingMenu = new FloatingMenu("搜尋開關");
+
+    (async () => {
+        // Prepare local active sites cache before starting manager scans
+        await manager.refreshActiveSites();
+        
+        for (const site of manager.sites) {
+            const checkbox    = document.createElement("input");
+            checkbox.type     = "checkbox";
+            checkbox.id       = `checkbox_${site.name}`;
+            checkbox.checked  = manager.activeSites[site.name];
+            checkbox.addEventListener("change", async () => {
+                await GM.setValue(`site_${site.name}`, checkbox.checked);
+                manager.activeSites[site.name] = checkbox.checked; // Synchronize memory cache
+            });
+
+            const label     = document.createElement("label");
+            label.textContent = site.name;
+            label.htmlFor   = `checkbox_${site.name}`;
+
+            const container = document.createElement("div");
+            container.className = "menu-item";
+            container.appendChild(checkbox);
+            container.appendChild(label);
+            floatingMenu.addContent(container);
+        }
+        
+        // Start manager scans
+        manager.start();
+    })();
+
+})();
