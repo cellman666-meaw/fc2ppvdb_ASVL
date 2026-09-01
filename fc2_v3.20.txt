@@ -1,0 +1,709 @@
+// ==UserScript==
+// @name         FC2CMADB 自動搜尋並添加鏈接
+// @namespace    fc2cmadb_ASVL3.20
+// @version      3.20.0
+// @description  自動搜尋多個網站，並在頁面左側添加可拖動 Pre-Configured ของแต่ละเวบไซต์เพื่อป้องกัน Rate-Limit. 支援無限捲動與SPA換頁。 (v3.20 Performance Optimized: Lazy-IO, Idle-Batch, LRU-Cache, Global-Throttle, Zero-Reflow)
+// @author       jjbigjj, Antigravity
+// @match        *://fc2cmadb.com/*
+// @match        *://*.fc2cmadb.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM.setValue
+// @grant        GM.getValue
+// @run-at       document-end
+// @connect      123av.com
+// @connect      missav.ws
+// @connect      missav.ai
+// @connect      missav.com
+// @connect      7mmtv.sx
+// @connect      7mmtv.tv
+// @connect      javfc2.xyz
+// @connect      sukebei.nyaa.si
+// @connect      supjav.com
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─────────────────────────────────────────────
+    // v3.20 Performance Constants
+    // ─────────────────────────────────────────────
+    const RE_NON_ALNUM = /[^a-z0-9]/g;
+    const RE_NON_NUM = /[^0-9]/g;
+    const RE_ARTICLE_ID = /\/articles\/(\d+)/;
+    const RE_NUM_5_9 = /^\d{5,9}$/;
+    const RE_ESCAPE = /[.*+?^${}()|[\]\\]/g;
+    const GLOBAL_MAX_CONCURRENT = 6;
+    let globalActive = 0;
+    const globalWaitQueue = [];
+
+    const COLOR_MAP = {
+        'bg-blue-500': '#3b82f6',
+        'bg-green-500': '#10b981',
+        'bg-red-500': '#ef4444',
+        'bg-purple-500': '#8b5cf6',
+        'bg-yellow-500': '#eab308',
+        'bg-orange-500': '#f97316',
+        'bg-gray-500': '#64748b'
+    };
+
+    const PARSER = new DOMParser();
+    // Reuse single regex for heading check
+    const RE_SEARCH_RESULT = /searchresultfor/;
+
+    // ─────────────────────────────────────────────
+    // Styles Injection (contain + will-change for perf)
+    // ─────────────────────────────────────────────
+    const style = document.createElement('style');
+    style.textContent = `
+        #floating-menu {
+            position: fixed;
+            top: 50%;
+            left: 0;
+            transform: translateY(-50%);
+            width: 220px;
+            background: rgba(15, 23, 42, 0.90) !important;
+            backdrop-filter: blur(12px) saturate(180%);
+            -webkit-backdrop-filter: blur(12px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.1) !important;
+            border-left: none !important;
+            color: #f8fafc !important;
+            padding: 16px !important;
+            border-radius: 0 16px 16px 0 !important;
+            z-index: 100000 !important;
+            box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5) !important;
+            font-family: system-ui, -apple-system, sans-serif !important;
+            transition: box-shadow 0.2s;
+            will-change: transform, left, top;
+            contain: layout paint style;
+            user-select: none;
+        }
+        #floating-menu-title {
+            font-weight: 700;
+            font-size: 13px;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 12px;
+            cursor: grab;
+            text-align: center;
+            color: #60a5fa !important;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 8px;
+            transition: color 0.2s;
+        }
+        #floating-menu-title:hover { color: #93c5fd !important; }
+        #floating-menu-content { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+        .menu-item { display: flex; align-items: center; padding: 6px 8px; border-radius: 8px; transition: background-color 0.2s; cursor: pointer; }
+        .menu-item:hover { background-color: rgba(255, 255, 255, 0.05); }
+        .menu-item input[type="checkbox"] { margin-right: 10px; cursor: pointer; accent-color: #3b82f6; width: 14px; height: 14px; }
+        .menu-item label { cursor: pointer; font-size: 13px; font-weight: 500; color: #e2e8f0; flex-grow: 1; }
+        .fc2cmadb-btn-container { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; z-index: 10; position: relative; contain: layout style; }
+        .fc2cmadb-search-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            font-size: 11px !important; font-weight: 600 !important; color: #ffffff !important;
+            padding: 3px 7px !important; border-radius: 6px !important; text-decoration: none !important;
+            transition: transform 0.15s, box-shadow 0.15s, filter 0.15s !important;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15) !important; border: none !important; cursor: pointer; line-height: 1.4;
+        }
+        .fc2cmadb-search-btn:hover { transform: translateY(-1px) !important; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.25) !important; filter: brightness(1.15) !important; }
+        .fc2cmadb-loading { display: inline-flex; align-items: center; font-size: 11px !important; color: #94a3b8 !important; font-style: italic; animation: cmapulse 1.5s infinite; padding: 2px 4px; }
+        @keyframes cmapulse { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
+    `;
+    document.head.appendChild(style);
+
+    // ─────────────────────────────────────────────
+    // Helpers - micro-optimized
+    // ─────────────────────────────────────────────
+    const cleanAlnum = (s) => s.toLowerCase().replace(RE_NON_ALNUM, '');
+    const numericOnly = (s) => s.replace(RE_NON_NUM, '') || s;
+
+    function resolveAbsoluteUrl(href, domain) {
+        if (!href) return '';
+        if (href.charCodeAt(0) === 104 && href.startsWith('http')) return href; // h
+        return `https://${domain}/${href.charCodeAt(0) === 47 ? href.slice(1) : href}`; // /
+    }
+
+    // Optimized findDirectPostLink: single pass over <a>, no Array.from, early exits
+    function findDirectPostLink(doc, domain, id) {
+        const cleanId = cleanAlnum(id);
+        if (!cleanId) return null;
+        // Fast path: use doc.links (live HTMLCollection) if available
+        const links = doc.links || doc.querySelectorAll('a');
+        // Avoid scanning huge pages fully - cap at 600 links (cards pages rarely exceed)
+        const len = Math.min(links.length, 600);
+        for (let i = 0; i < len; i++) {
+            const a = links[i];
+            const hrefRaw = a.getAttribute('href');
+            if (!hrefRaw) continue;
+            const href = hrefRaw.toLowerCase();
+            if (href === '#' || href === '/' || href.charCodeAt(0) === 106) continue; // j for javascript:
+            if (href.includes('?s=') || href.includes('keyword=') || href.includes('search') ||
+                href.includes('/category/') || href.includes('/tag/') || href.includes('/page/') || href.includes('/genre/')) continue;
+
+            // cheapest check first: href
+            const cleanHref = href.replace(RE_NON_ALNUM, '');
+            if (cleanHref.includes(cleanId)) {
+                if (href.includes(domain) || hrefRaw.charCodeAt(0) === 47 || hrefRaw.charCodeAt(0) === 46) return a;
+            } else {
+                // only compute text/alt if href miss
+                const cleanText = a.textContent.toLowerCase().replace(RE_NON_ALNUM, '');
+                if (cleanText.includes(cleanId)) {
+                    if (href.includes(domain) || hrefRaw.charCodeAt(0) === 47 || hrefRaw.charCodeAt(0) === 46) return a;
+                    continue;
+                }
+                const img = a.querySelector('img');
+                if (img) {
+                    const alt = img.getAttribute('alt');
+                    if (alt && alt.toLowerCase().replace(RE_NON_ALNUM, '').includes(cleanId)) {
+                        if (href.includes(domain) || hrefRaw.charCodeAt(0) === 47 || hrefRaw.charCodeAt(0) === 46) return a;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    function acquireGlobalSlot() {
+        if (globalActive < GLOBAL_MAX_CONCURRENT) { globalActive++; return true; }
+        return false;
+    }
+    function releaseGlobalSlot() {
+        globalActive = Math.max(0, globalActive - 1);
+        if (globalWaitQueue.length) {
+            const fn = globalWaitQueue.shift();
+            globalActive++;
+            fn();
+        }
+    }
+    function enqueueGlobal(fn) {
+        if (acquireGlobalSlot()) fn();
+        else globalWaitQueue.push(fn);
+    }
+
+    // ─────────────────────────────────────────────
+    // FloatingMenu - pointer events + rAF
+    // ─────────────────────────────────────────────
+    class FloatingMenu {
+        constructor(titleText) {
+            this.isDragging = false;
+            this.wasDragged = false;
+            this.offsetX = 0;
+            this.offsetY = 0;
+            this.rafId = 0;
+            this.nextX = 0; this.nextY = 0;
+            this.createMenu(titleText);
+        }
+        createMenu(titleText) {
+            this.menu = document.createElement("div");
+            this.menu.id = "floating-menu";
+            document.body.appendChild(this.menu);
+            this.title = document.createElement("div");
+            this.title.id = "floating-menu-title";
+            this.title.textContent = `🔍 ${titleText}`;
+            this.menu.appendChild(this.title);
+            this.content = document.createElement("div");
+            this.content.id = "floating-menu-content";
+            this.content.style.display = "none";
+            this.menu.appendChild(this.content);
+            this._bindEvents();
+        }
+        _bindEvents() {
+            this.title.addEventListener("click", () => {
+                if (this.wasDragged) { this.wasDragged = false; return; }
+                this.content.style.display = this.content.style.display === "none" ? "flex" : "none";
+            });
+            this.title.addEventListener("pointerdown", (e) => {
+                this.isDragging = true;
+                this.wasDragged = false;
+                const r = this.menu.getBoundingClientRect();
+                this.offsetX = e.clientX - r.left;
+                this.offsetY = e.clientY - r.top;
+                this.title.setPointerCapture(e.pointerId);
+                this.title.style.cursor = "grabbing";
+                document.body.style.userSelect = "none";
+                e.preventDefault();
+            });
+            const onMove = (e) => {
+                if (!this.isDragging) return;
+                this.wasDragged = true;
+                this.nextX = e.clientX - this.offsetX;
+                this.nextY = e.clientY - this.offsetY;
+                if (!this.rafId) {
+                    this.rafId = requestAnimationFrame(() => {
+                        this.rafId = 0;
+                        this.menu.style.left = `${this.nextX}px`;
+                        this.menu.style.top = `${this.nextY}px`;
+                        this.menu.style.transform = "none";
+                    });
+                }
+            };
+            const onUp = () => {
+                if (!this.isDragging) return;
+                this.isDragging = false;
+                this.title.style.cursor = "grab";
+                document.body.style.userSelect = "";
+                if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
+                // reset wasDragged after click suppression window
+                if (this.wasDragged) setTimeout(() => { this.wasDragged = false; }, 120);
+            };
+            document.addEventListener("pointermove", onMove, { passive: true });
+            document.addEventListener("pointerup", onUp);
+            document.addEventListener("pointercancel", onUp);
+        }
+        addContent(el) { this.content.appendChild(el); }
+    }
+
+    // ─────────────────────────────────────────────
+    // Utils - LRU session cache + batched GM storage
+    // ─────────────────────────────────────────────
+    class Utils {
+        static sessionCache = new Map(); // LRU
+        static MAX_SESSION = 600;
+        static pendingSearches = new Map();
+
+        static _touchLRU(key) {
+            const v = this.sessionCache.get(key);
+            if (v !== undefined) { this.sessionCache.delete(key); this.sessionCache.set(key, v); }
+        }
+        static _setLRU(key, val) {
+            if (this.sessionCache.has(key)) this.sessionCache.delete(key);
+            else if (this.sessionCache.size >= this.MAX_SESSION) {
+                const first = this.sessionCache.keys().next().value;
+                this.sessionCache.delete(first);
+            }
+            this.sessionCache.set(key, val);
+        }
+
+        static showLoading(container, siteName) {
+            if (!container) return null;
+            const el = document.createElement("span");
+            el.textContent = `🔍 [${siteName}]...`;
+            el.className = "fc2cmadb-loading";
+            el.dataset.site = siteName;
+            container.appendChild(el);
+            return el;
+        }
+        static removeLoading(el) { if (el) el.remove(); }
+
+        static createButton(url, text, bgColorClass) {
+            const a = document.createElement("a");
+            a.href = url;
+            a.textContent = text;
+            a.className = "fc2cmadb-search-btn";
+            a.style.backgroundColor = COLOR_MAP[bgColorClass] || '#6366f1';
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            return a;
+        }
+
+        static async cacheResult(key, data, expiryHours = 12) {
+            this._setLRU(key, data);
+            const expiry = Date.now() + expiryHours * 3_600_000;
+            // fire-and-forget GM.setValue to not block queue (still await for correctness, but not idle)
+            try { await GM.setValue(key, { data, expiry }); } catch {}
+        }
+
+        static async getCachedResult(key) {
+            if (this.sessionCache.has(key)) {
+                const v = this.sessionCache.get(key);
+                this._touchLRU(key);
+                return v;
+            }
+            let cached = null;
+            try { cached = await GM.getValue(key, null); } catch {}
+            if (!cached) { this._setLRU(key, null); return null; }
+            if (cached.expiry < Date.now()) {
+                try { await GM.setValue(key, null); } catch {}
+                this._setLRU(key, null);
+                return null;
+            }
+            this._setLRU(key, cached.data);
+            return cached.data;
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Site - global throttle + batch dedup
+    // ─────────────────────────────────────────────
+    class Site {
+        constructor(name, searchUrlFunc, responseHandler, buttonColor, queryInterval = 800, maxConcurrentSearches = 2) {
+            this.name = name;
+            this.searchUrlFunc = searchUrlFunc;
+            this.responseHandler = responseHandler;
+            this.buttonColor = buttonColor;
+            this.queryInterval = queryInterval;
+            this.maxConcurrentSearches = maxConcurrentSearches;
+            this.queue = [];
+            this.active = 0;
+        }
+        addToQueue(id, container) {
+            this.queue.push({ id, container });
+            this._schedule();
+        }
+        _schedule() {
+            while (this.queue.length && this.active < this.maxConcurrentSearches) {
+                const task = this.queue.shift();
+                this.active++;
+                const run = async () => {
+                    try { await this.search(task.id, task.container); }
+                    catch (e) { console.error(`[${this.name}]`, e); }
+                    finally {
+                        this.active--;
+                        releaseGlobalSlot();
+                        // per-site interval before next
+                        setTimeout(() => this._schedule(), this.queryInterval);
+                    }
+                };
+                enqueueGlobal(run);
+                // if queued globally, active already counted, but global slot may be pending
+                if (globalActive > GLOBAL_MAX_CONCURRENT) break;
+            }
+        }
+        async search(id, container) {
+            if (!container.isConnected) return;
+            const cacheKey = `${this.name}_${id}`;
+            // check pending first (dedup identical id across multiple cards)
+            if (Utils.pendingSearches.has(cacheKey)) {
+                const url = await Utils.pendingSearches.get(cacheKey);
+                if (url && container.isConnected) this.addButton(container, url);
+                return;
+            }
+            const cached = await Utils.getCachedResult(cacheKey);
+            if (cached) {
+                if (cached.url && container.isConnected) this.addButton(container, cached.url);
+                return;
+            }
+            const searchUrl = this.searchUrlFunc(id);
+            const loadingEl = Utils.showLoading(container, this.name);
+
+            const promise = new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: searchUrl,
+                    timeout: 12000,
+                    headers: { "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+                    onload: (res) => {
+                        if (res.status !== 200) {
+                            Utils.removeLoading(loadingEl);
+                            Utils.cacheResult(cacheKey, { url: '' }, 0.05);
+                            resolve('');
+                            return;
+                        }
+                        const previewData = { url: '' };
+                        try { this.responseHandler(res, id, previewData); } catch (e) { console.error(`[${this.name}] parse`, e); }
+                        if (previewData.url && container.isConnected) this.addButton(container, previewData.url);
+                        Utils.removeLoading(loadingEl);
+                        Utils.cacheResult(cacheKey, previewData, previewData.url ? 24 : 12);
+                        resolve(previewData.url);
+                    },
+                    onerror: () => { Utils.removeLoading(loadingEl); Utils.cacheResult(cacheKey, { url: '' }, 0.05); resolve(''); },
+                    ontimeout: () => { Utils.removeLoading(loadingEl); Utils.cacheResult(cacheKey, { url: '' }, 0.05); resolve(''); }
+                });
+            });
+            Utils.pendingSearches.set(cacheKey, promise);
+            try { await promise; } finally { Utils.pendingSearches.delete(cacheKey); }
+        }
+        addButton(container, url) {
+            if (!container || !container.isConnected) return;
+            if (container.querySelector(`.fc2cmadb-search-btn[data-site="${this.name}"]`)) return;
+            const btn = Utils.createButton(url, this.name, this.buttonColor);
+            btn.dataset.site = this.name;
+            btn.addEventListener("click", e => e.stopPropagation());
+            container.appendChild(btn);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // SearchManager - IntersectionObserver lazy + idle batch
+    // ─────────────────────────────────────────────
+    class SearchManager {
+        constructor() {
+            this.sites = [];
+            this.activeSites = {};
+            this._observer = null;
+            this._lastUrl = location.href;
+            this._spaTimer = null;
+            this._scanScheduled = false;
+            this._pendingCards = new Set();
+            this._detailSeen = '';
+            this._io = null;
+        }
+        addSite(s) { this.sites.push(s); }
+
+        async refreshActiveSites() {
+            const results = await Promise.all(this.sites.map(s => GM.getValue(`site_${s.name}`, true).catch(() => true)));
+            this.sites.forEach((s, i) => this.activeSites[s.name] = results[i]);
+        }
+
+        async start() {
+            await this.refreshActiveSites();
+            this._setupIO();
+            this.scanPage();
+            this._watchDOM();
+            this._watchSPA();
+            // hydration fallback - 3 scans only, via idle
+            let n = 0;
+            const t = setInterval(() => { this.scheduleScan(); if (++n >= 3) clearInterval(t); }, 700);
+        }
+
+        _setupIO() {
+            if (this._io) return;
+            this._io = new IntersectionObserver((entries) => {
+                for (const e of entries) {
+                    if (!e.isIntersecting) continue;
+                    const card = e.target;
+                    this._io.unobserve(card);
+                    this._processCard(card);
+                }
+            }, { rootMargin: '600px 0px', threshold: 0.01 });
+        }
+
+        scheduleScan() {
+            if (this._scanScheduled) return;
+            this._scanScheduled = true;
+            const cb = () => { this._scanScheduled = false; this.scanPage(); };
+            if ('requestIdleCallback' in window) requestIdleCallback(cb, { timeout: 300 });
+            else setTimeout(cb, 80);
+        }
+
+        _processCard(card) {
+            if (card.dataset.fc2Searched === '1') return;
+            let id = null;
+            // fast path: href
+            const link = card.querySelector('a[href*="/articles/"]');
+            if (link) {
+                const href = link.getAttribute('href');
+                const m = href ? href.match(RE_ARTICLE_ID) : null;
+                if (m) id = m[1];
+            }
+            if (!id) {
+                const spanEl = card.querySelector("figure span, span.absolute");
+                if (spanEl) {
+                    const t = spanEl.textContent.trim();
+                    if (RE_NUM_5_9.test(t)) id = t;
+                }
+            }
+            if (!id) return;
+            card.dataset.fc2Searched = '1';
+
+            let btnBox = card.querySelector(".fc2cmadb-btn-container");
+            if (!btnBox) {
+                btnBox = document.createElement("div");
+                btnBox.className = "fc2cmadb-btn-container";
+                const body = card.querySelector(".card-body") || card;
+                body.appendChild(btnBox);
+            }
+            for (const site of this.sites) if (this.activeSites[site.name]) site.addToQueue(id, btnBox);
+        }
+
+        scanPage() {
+            // 1) cards - lazy via IO if available, else immediate
+            const cards = document.querySelectorAll("div.card:not([data-fc2-searched])");
+            // fallback selector for edge cases
+            const extra = cards.length < 8 ? document.querySelectorAll("div[class*='card']:not([data-fc2-searched]):not(.card)") : [];
+            const all = extra.length ? [...cards, ...extra] : cards;
+            for (const card of all) {
+                if (card.dataset.fc2Searched === '1') continue;
+                // if card is already in viewport or IO not supported, process immediately; else observe
+                if (this._io && typeof this._io.observe === 'function') {
+                    // quick viewport check to avoid IO delay for above-fold
+                    const rect = card.getBoundingClientRect();
+                    if (rect.top < window.innerHeight + 600) this._processCard(card);
+                    else this._io.observe(card);
+                } else {
+                    this._processCard(card);
+                }
+            }
+
+            // 2) detail page
+            const m = location.pathname.match(RE_ARTICLE_ID);
+            if (m) {
+                const id = m[1];
+                if (this._detailSeen === id && document.getElementById("detail-search-buttons")) return;
+                const titleEl = document.querySelector("h1:not([data-searched])");
+                if (titleEl) {
+                    titleEl.dataset.searched = "1";
+                    this._detailSeen = id;
+                    let box = document.getElementById("detail-search-buttons");
+                    if (!box) {
+                        box = document.createElement("div");
+                        box.id = "detail-search-buttons";
+                        box.className = "fc2cmadb-btn-container";
+                        box.style.marginTop = "10px";
+                        box.style.marginBottom = "10px";
+                        const anchorParent = titleEl.closest("a") || titleEl;
+                        anchorParent.parentNode.insertBefore(box, anchorParent.nextSibling);
+                        for (const site of this.sites) if (this.activeSites[site.name]) site.addToQueue(id, box);
+                    }
+                }
+            }
+        }
+
+        _watchDOM() {
+            if (this._observer) return;
+            const target = document.querySelector("#app, main, [data-page], body");
+            let debounce = 0;
+            this._observer = new MutationObserver((mutations) => {
+                // filter noise: only care if new nodes added
+                let hasNew = false;
+                for (const m of mutations) if (m.addedNodes.length) { hasNew = true; break; }
+                if (!hasNew) return;
+                clearTimeout(debounce);
+                debounce = setTimeout(() => this.scheduleScan(), 180);
+            });
+            this._observer.observe(target, { childList: true, subtree: true });
+        }
+
+        _watchSPA() {
+            const checkUrl = () => {
+                if (location.href === this._lastUrl) return;
+                this._lastUrl = location.href;
+                // cleanup IO pending
+                if (this._io) this._io.disconnect();
+                const old = document.getElementById("detail-search-buttons");
+                if (old) old.remove();
+                const h1 = document.querySelector("h1");
+                if (h1) delete h1.dataset.searched;
+                this._detailSeen = '';
+                clearTimeout(this._spaTimer);
+                this._spaTimer = setTimeout(() => this.scanPage(), 250);
+            };
+            const _push = history.pushState.bind(history);
+            const _replace = history.replaceState.bind(history);
+            history.pushState = function (...a) { _push(...a); checkUrl(); };
+            history.replaceState = function (...a) { _replace(...a); checkUrl(); };
+            window.addEventListener("popstate", checkUrl);
+            window.addEventListener("hashchange", checkUrl);
+            document.addEventListener("inertia:finish", checkUrl);
+            document.addEventListener("inertia:navigate", checkUrl);
+            // also watch URL via interval for edge cases (cheap)
+            setInterval(checkUrl, 1500);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Bootstrap
+    // ─────────────────────────────────────────────
+    const manager = new SearchManager();
+
+    manager.addSite(new Site('_123av',
+        id => `https://123av.com/ja/search?keyword=${numericOnly(id)}`,
+        (res, id, out) => {
+            const cleanId = cleanAlnum(id);
+            // finalUrl redirect check first (cheapest)
+            if (res.finalUrl) {
+                const cf = cleanAlnum(res.finalUrl);
+                if (cf.includes(cleanId) && !res.finalUrl.includes('search')) { out.url = res.finalUrl; return; }
+            }
+            const doc = PARSER.parseFromString(res.responseText, "text/html");
+            const link = findDirectPostLink(doc, '123av.com', id);
+            if (link) { out.url = resolveAbsoluteUrl(link.getAttribute('href'), '123av.com'); return; }
+            const vc = doc.querySelector(".text-muted")?.textContent.trim();
+            if (vc && vc !== "0 视频" && vc !== "0 件") out.url = `https://123av.com/ja/search?keyword=${numericOnly(id)}`;
+        }, 'bg-blue-500', 800, 2));
+
+    manager.addSite(new Site('MissAV',
+        id => `https://missav.ws/search/${numericOnly(id)}`,
+        (res, id, out) => {
+            const cleanId = cleanAlnum(id);
+            if (res.finalUrl) {
+                const cf = cleanAlnum(res.finalUrl);
+                if (cf.includes(cleanId) && !res.finalUrl.includes('/search')) { out.url = res.finalUrl; return; }
+            }
+            const doc = PARSER.parseFromString(res.responseText, "text/html");
+            // optimized single-pass scan
+            const links = doc.links;
+            for (let i = 0; i < Math.min(links.length, 600); i++) {
+                const a = links[i];
+                const href = (a.getAttribute('href') || '').toLowerCase();
+                if (!href || href.includes('/search')) continue;
+                const cleanHref = href.replace(RE_NON_ALNUM, '');
+                if (cleanHref.includes(cleanId)) { out.url = resolveAbsoluteUrl(a.getAttribute('href'), 'missav.ws'); return; }
+                const alt = (a.getAttribute('alt') || '').toLowerCase().replace(RE_NON_ALNUM, '');
+                if (alt.includes(cleanId)) { out.url = resolveAbsoluteUrl(a.getAttribute('href'), 'missav.ws'); return; }
+            }
+        }, 'bg-green-500', 800, 2));
+
+    manager.addSite(new Site('7MMTV',
+        id => `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(numericOnly(id))}&search_type=searchall&op=search`,
+        (res, id, out) => {
+            const cleanNum = numericOnly(id);
+            // regex from text is fastest, do before DOM parse
+            const esc = cleanNum.replace(RE_ESCAPE, '\\$&');
+            const re = new RegExp(`搜索 "${esc}" \\((\\d+)\\)`);
+            const m = res.responseText.match(re);
+            if (m && parseInt(m[1]) > 0) { out.url = `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(cleanNum)}`; return; }
+            const doc = PARSER.parseFromString(res.responseText, "text/html");
+            const link = findDirectPostLink(doc, '7mmtv.sx', id);
+            if (link) out.url = resolveAbsoluteUrl(link.getAttribute('href'), '7mmtv.sx');
+        }, 'bg-red-500', 800, 2));
+
+    manager.addSite(new Site('JAVFC2',
+        id => `https://javfc2.xyz/?s=${numericOnly(id)}`,
+        (res, id, out) => {
+            const doc = PARSER.parseFromString(res.responseText, "text/html");
+            const link = findDirectPostLink(doc, 'javfc2.xyz', id);
+            if (link) { out.url = resolveAbsoluteUrl(link.getAttribute('href'), 'javfc2.xyz'); return; }
+            // check nothing-found via single query (cheaper than Array.from + find)
+            const nf = doc.querySelector('.not-found, .no-results');
+            if (nf) return;
+            // fallback text check without allocating array
+            if (res.responseText.includes("Nothing found") || res.responseText.includes("No results")) return;
+            out.url = `https://javfc2.xyz/?s=${numericOnly(id)}`;
+        }, 'bg-purple-500', 800, 2));
+
+    manager.addSite(new Site('Sukebei',
+        id => `https://sukebei.nyaa.si/?page=rss&q=${encodeURIComponent(numericOnly(id))}&c=0_0&f=0`,
+        (res, id, out) => {
+            // RSS: string includes <item> is enough, avoid XML parse when empty
+            if (!res.responseText.includes('<item')) return;
+            const doc = PARSER.parseFromString(res.responseText, "text/xml");
+            if (doc.querySelector("item")) out.url = `https://sukebei.nyaa.si/?f=0&c=0_0&q=${encodeURIComponent(numericOnly(id))}&s=seeders&o=desc`;
+        }, 'bg-yellow-500', 1500, 1));
+
+    manager.addSite(new Site('SupJav',
+        id => `https://supjav.com/?s=${numericOnly(id)}`,
+        (res, id, out) => {
+            const cleanId = cleanAlnum(id);
+            if (res.finalUrl) {
+                const cf = cleanAlnum(res.finalUrl);
+                if (cf.includes(cleanId) && !res.finalUrl.includes('?s=')) { out.url = res.finalUrl; return; }
+            }
+            const doc = PARSER.parseFromString(res.responseText, "text/html");
+            const link = findDirectPostLink(doc, 'supjav.com', id);
+            if (link) { out.url = resolveAbsoluteUrl(link.getAttribute('href'), 'supjav.com'); return; }
+            const heading = doc.querySelector("h1, h2, h3, .page-title, .page-header, .archive-title");
+            if (heading) {
+                const ch = cleanAlnum(heading.textContent);
+                if (ch.includes("searchresultfor") && ch.includes(cleanId)) {
+                    const cm = heading.textContent.match(/\((\d+)\)/);
+                    if (cm && parseInt(cm[1]) > 0) { out.url = `https://supjav.com/?s=${numericOnly(id)}`; return; }
+                }
+            }
+            if (doc.body && cleanAlnum(doc.body.textContent).includes(cleanId) && doc.querySelector('.post, .posts, article, .img')) {
+                out.url = `https://supjav.com/?s=${numericOnly(id)}`;
+            }
+        }, 'bg-orange-500', 1200, 1));
+
+    const floatingMenu = new FloatingMenu("搜尋開關");
+    (async () => {
+        await manager.refreshActiveSites();
+        const frag = document.createDocumentFragment();
+        for (const site of manager.sites) {
+            const cb = document.createElement("input");
+            cb.type = "checkbox"; cb.id = `checkbox_${site.name}`; cb.checked = manager.activeSites[site.name];
+            cb.addEventListener("change", async () => { await GM.setValue(`site_${site.name}`, cb.checked); manager.activeSites[site.name] = cb.checked; if (cb.checked) manager.scheduleScan(); });
+            const label = document.createElement("label"); label.textContent = site.name; label.htmlFor = `checkbox_${site.name}`;
+            const row = document.createElement("div"); row.className = "menu-item";
+            row.appendChild(cb); row.appendChild(label);
+            // click row toggles
+            row.addEventListener("click", (e) => { if (e.target !== cb) cb.click(); });
+            frag.appendChild(row);
+        }
+        floatingMenu.addContent(frag);
+        manager.start();
+    })();
+})();
