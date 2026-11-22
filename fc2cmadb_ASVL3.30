@@ -1,0 +1,871 @@
+// ==UserScript==
+// @name         FC2CMADB 自動搜尋並添加鏈接
+// @namespace    fc2cmadb_ASVL3.30
+// @version      3.30.0
+// @description  自動搜尋多個網站，並在頁面左側添加可拖動 Pre-Configured ของแต่ละเวบไซต์เพื่อป้องกัน Rate-Limit. 支援無限捲動與SPA換頁。 (v3.30 Ultra-Perf: Zero-DOM Regex, Zero-Reflow IO, GPU Transform, Mutation-Shield, Batched-Cache)
+// @author       jjbigjj, Antigravity
+// @match        *://fc2cmadb.com/*
+// @match        *://*.fc2cmadb.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM.setValue
+// @grant        GM.getValue
+// @run-at       document-end
+// @connect      123av.com
+// @connect      missav.ws
+// @connect      missav.ai
+// @connect      missav.com
+// @connect      7mmtv.sx
+// @connect      7mmtv.tv
+// @connect      javfc2.xyz
+// @connect      sukebei.nyaa.si
+// @connect      supjav.com
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─────────────────────────────────────────────
+    // v3.30 Performance Constants & Regex Pool
+    // ─────────────────────────────────────────────
+    const RE_NON_ALNUM = /[^a-z0-9]/g;
+    const RE_NON_NUM = /[^0-9]/g;
+    const RE_ARTICLE_ID = /\/articles\/(\d+)/;
+    const RE_NUM_5_9 = /^\d{5,9}$/;
+    const RE_ESCAPE = /[.*+?^${}()|[\]\\]/g;
+    const RE_HREF_TAG = /<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    const RE_IMG_ALT = /<img\b[^>]*\balt=["']([^"']+)["'][^>]*>/i;
+
+    const GLOBAL_MAX_CONCURRENT = 6;
+    let globalActive = 0;
+    const globalWaitQueue = [];
+
+    const COLOR_MAP = {
+        'bg-blue-500': '#3b82f6',
+        'bg-green-500': '#10b981',
+        'bg-red-500': '#ef4444',
+        'bg-purple-500': '#8b5cf6',
+        'bg-yellow-500': '#eab308',
+        'bg-orange-500': '#f97316',
+        'bg-gray-500': '#64748b'
+    };
+
+    let domParserInstance = null;
+    function getParser() {
+        if (!domParserInstance) domParserInstance = new DOMParser();
+        return domParserInstance;
+    }
+
+    // ─────────────────────────────────────────────
+    // Styles Injection (Hardware-Accelerated + Strict Containment)
+    // ─────────────────────────────────────────────
+    const style = document.createElement('style');
+    style.textContent = `
+        #floating-menu {
+            position: fixed;
+            top: 50%;
+            left: 0;
+            transform: translate3d(0, -50%, 0);
+            width: 220px;
+            background: rgba(15, 23, 42, 0.92) !important;
+            backdrop-filter: blur(12px) saturate(180%);
+            -webkit-backdrop-filter: blur(12px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.12) !important;
+            border-left: none !important;
+            color: #f8fafc !important;
+            padding: 16px !important;
+            border-radius: 0 16px 16px 0 !important;
+            z-index: 100000 !important;
+            box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5) !important;
+            font-family: system-ui, -apple-system, sans-serif !important;
+            contain: layout paint style;
+            user-select: none;
+            will-change: transform;
+        }
+        #floating-menu-title {
+            font-weight: 700;
+            font-size: 13px;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 12px;
+            cursor: grab;
+            text-align: center;
+            color: #60a5fa !important;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 8px;
+            transition: color 0.15s;
+        }
+        #floating-menu-title:hover { color: #93c5fd !important; }
+        #floating-menu-content { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+        .menu-item { display: flex; align-items: center; padding: 6px 8px; border-radius: 8px; transition: background-color 0.15s; cursor: pointer; }
+        .menu-item:hover { background-color: rgba(255, 255, 255, 0.06); }
+        .menu-item input[type="checkbox"] { margin-right: 10px; cursor: pointer; accent-color: #3b82f6; width: 14px; height: 14px; }
+        .menu-item label { cursor: pointer; font-size: 13px; font-weight: 500; color: #e2e8f0; flex-grow: 1; }
+        .fc2cmadb-btn-container { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; z-index: 10; position: relative; contain: layout style; }
+        .fc2cmadb-search-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            font-size: 11px !important; font-weight: 600 !important; color: #ffffff !important;
+            padding: 3px 7px !important; border-radius: 6px !important; text-decoration: none !important;
+            transition: transform 0.15s, box-shadow 0.15s, filter 0.15s !important;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15) !important; border: none !important; cursor: pointer; line-height: 1.4;
+        }
+        .fc2cmadb-search-btn:hover { transform: translateY(-1px) !important; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.25) !important; filter: brightness(1.15) !important; }
+        .fc2cmadb-loading { display: inline-flex; align-items: center; font-size: 11px !important; color: #94a3b8 !important; font-style: italic; animation: cmapulse 1.5s infinite; padding: 2px 4px; }
+        @keyframes cmapulse { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
+    `;
+    document.head.appendChild(style);
+
+    // ─────────────────────────────────────────────
+    // High-Performance Helpers
+    // ─────────────────────────────────────────────
+    const cleanAlnum = (s) => (s ? s.toLowerCase().replace(RE_NON_ALNUM, '') : '');
+    const numericOnly = (s) => (s ? s.replace(RE_NON_NUM, '') || s : '');
+
+    function resolveAbsoluteUrl(href, domain) {
+        if (!href) return '';
+        if (href.startsWith('http://') || href.startsWith('https://')) return href;
+        return `https://${domain}/${href.charCodeAt(0) === 47 ? href.slice(1) : href}`;
+    }
+
+    /**
+     * Zero-DOM Fast Regex Extractor:
+     * Scans raw HTML string for direct links matching ID without DOMParser overhead.
+     */
+    function fastFindDirectLink(html, domain, id) {
+        const cleanId = cleanAlnum(id);
+        if (!cleanId || !html) return null;
+
+        RE_HREF_TAG.lastIndex = 0;
+        let match;
+        let count = 0;
+
+        while ((match = RE_HREF_TAG.exec(html)) !== null && count++ < 350) {
+            const rawHref = match[1];
+            if (!rawHref) continue;
+            const href = rawHref.toLowerCase();
+            if (href === '#' || href === '/' || href.startsWith('javascript:')) continue;
+            if (href.includes('?s=') || href.includes('keyword=') || href.includes('search') ||
+                href.includes('/category/') || href.includes('/tag/') || href.includes('/page/') || href.includes('/genre/')) {
+                continue;
+            }
+
+            const cleanHref = href.replace(RE_NON_ALNUM, '');
+            if (cleanHref.includes(cleanId)) {
+                if (href.includes(domain) || rawHref.charCodeAt(0) === 47 || rawHref.charCodeAt(0) === 46) {
+                    return resolveAbsoluteUrl(rawHref, domain);
+                }
+            }
+
+            const innerHtml = match[2];
+            if (innerHtml) {
+                const cleanInner = innerHtml.toLowerCase().replace(RE_NON_ALNUM, '');
+                if (cleanInner.includes(cleanId)) {
+                    if (href.includes(domain) || rawHref.charCodeAt(0) === 47 || rawHref.charCodeAt(0) === 46) {
+                        return resolveAbsoluteUrl(rawHref, domain);
+                    }
+                }
+                const altMatch = innerHtml.match(RE_IMG_ALT);
+                if (altMatch && altMatch[1]) {
+                    const cleanAlt = altMatch[1].toLowerCase().replace(RE_NON_ALNUM, '');
+                    if (cleanAlt.includes(cleanId)) {
+                        if (href.includes(domain) || rawHref.charCodeAt(0) === 47 || rawHref.charCodeAt(0) === 46) {
+                            return resolveAbsoluteUrl(rawHref, domain);
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // DOM fallback scanner only when regex encounters complex structures
+    function fallbackFindDirectLink(doc, domain, id) {
+        const cleanId = cleanAlnum(id);
+        if (!cleanId) return null;
+        const links = doc.links || doc.querySelectorAll('a');
+        const len = Math.min(links.length, 300);
+        for (let i = 0; i < len; i++) {
+            const a = links[i];
+            const hrefRaw = a.getAttribute('href');
+            if (!hrefRaw) continue;
+            const href = hrefRaw.toLowerCase();
+            if (href === '#' || href === '/' || href.startsWith('javascript:')) continue;
+            if (href.includes('?s=') || href.includes('keyword=') || href.includes('search') ||
+                href.includes('/category/') || href.includes('/tag/') || href.includes('/page/') || href.includes('/genre/')) continue;
+
+            const cleanHref = href.replace(RE_NON_ALNUM, '');
+            if (cleanHref.includes(cleanId)) {
+                if (href.includes(domain) || hrefRaw.charCodeAt(0) === 47 || hrefRaw.charCodeAt(0) === 46) {
+                    return resolveAbsoluteUrl(hrefRaw, domain);
+                }
+            }
+        }
+        return null;
+    }
+
+    // ─────────────────────────────────────────────
+    // Global Concurrency Throttler
+    // ─────────────────────────────────────────────
+    function acquireGlobalSlot() {
+        if (globalActive < GLOBAL_MAX_CONCURRENT) {
+            globalActive++;
+            return true;
+        }
+        return false;
+    }
+    function releaseGlobalSlot() {
+        globalActive = Math.max(0, globalActive - 1);
+        if (globalWaitQueue.length > 0) {
+            const next = globalWaitQueue.shift();
+            globalActive++;
+            next();
+        }
+    }
+    function enqueueGlobal(fn) {
+        if (acquireGlobalSlot()) fn();
+        else globalWaitQueue.push(fn);
+    }
+
+    // ─────────────────────────────────────────────
+    // FloatingMenu - GPU-Accelerated Dragging
+    // ─────────────────────────────────────────────
+    class FloatingMenu {
+        constructor(titleText) {
+            this.isDragging = false;
+            this.wasDragged = false;
+            this.startX = 0;
+            this.startY = 0;
+            this.currentX = 0;
+            this.currentY = 0;
+            this.rafId = 0;
+            this.createMenu(titleText);
+        }
+        createMenu(titleText) {
+            this.menu = document.createElement("div");
+            this.menu.id = "floating-menu";
+            document.body.appendChild(this.menu);
+
+            this.title = document.createElement("div");
+            this.title.id = "floating-menu-title";
+            this.title.textContent = `🔍 ${titleText}`;
+            this.menu.appendChild(this.title);
+
+            this.content = document.createElement("div");
+            this.content.id = "floating-menu-content";
+            this.content.style.display = "none";
+            this.menu.appendChild(this.content);
+
+            this._bindEvents();
+        }
+        _bindEvents() {
+            this.title.addEventListener("click", () => {
+                if (this.wasDragged) { this.wasDragged = false; return; }
+                this.content.style.display = this.content.style.display === "none" ? "flex" : "none";
+            });
+
+            this.title.addEventListener("pointerdown", (e) => {
+                this.isDragging = true;
+                this.wasDragged = false;
+                this.startX = e.clientX - this.currentX;
+                this.startY = e.clientY - this.currentY;
+                this.title.setPointerCapture(e.pointerId);
+                this.title.style.cursor = "grabbing";
+                document.body.style.userSelect = "none";
+                e.preventDefault();
+            });
+
+            const onMove = (e) => {
+                if (!this.isDragging) return;
+                this.wasDragged = true;
+                this.currentX = e.clientX - this.startX;
+                this.currentY = e.clientY - this.startY;
+
+                if (!this.rafId) {
+                    this.rafId = requestAnimationFrame(() => {
+                        this.rafId = 0;
+                        // GPU-accelerated transform: zero reflow
+                        this.menu.style.transform = `translate3d(${this.currentX}px, calc(-50% + ${this.currentY}px), 0)`;
+                    });
+                }
+            };
+
+            const onUp = () => {
+                if (!this.isDragging) return;
+                this.isDragging = false;
+                this.title.style.cursor = "grab";
+                document.body.style.userSelect = "";
+                if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
+                if (this.wasDragged) setTimeout(() => { this.wasDragged = false; }, 120);
+            };
+
+            document.addEventListener("pointermove", onMove, { passive: true });
+            document.addEventListener("pointerup", onUp);
+            document.addEventListener("pointercancel", onUp);
+        }
+        addContent(el) { this.content.appendChild(el); }
+    }
+
+    // ─────────────────────────────────────────────
+    // Utils - LRU Memory Cache + Batched Storage
+    // ─────────────────────────────────────────────
+    class Utils {
+        static sessionCache = new Map();
+        static MAX_SESSION = 800;
+        static pendingSearches = new Map();
+        static storageWriteQueue = new Map();
+        static storageTimer = null;
+
+        static _touchLRU(key) {
+            const v = this.sessionCache.get(key);
+            if (v !== undefined) {
+                this.sessionCache.delete(key);
+                this.sessionCache.set(key, v);
+            }
+        }
+        static _setLRU(key, val) {
+            if (this.sessionCache.has(key)) {
+                this.sessionCache.delete(key);
+            } else if (this.sessionCache.size >= this.MAX_SESSION) {
+                const oldest = this.sessionCache.keys().next().value;
+                this.sessionCache.delete(oldest);
+            }
+            this.sessionCache.set(key, val);
+        }
+
+        static showLoading(container, siteName) {
+            if (!container || !container.isConnected) return null;
+            const el = document.createElement("span");
+            el.textContent = `🔍 [${siteName}]...`;
+            el.className = "fc2cmadb-loading";
+            el.dataset.site = siteName;
+            container.appendChild(el);
+            return el;
+        }
+        static removeLoading(el) {
+            if (el && el.parentNode) el.remove();
+        }
+
+        static createButton(url, text, bgColorClass) {
+            const a = document.createElement("a");
+            a.href = url;
+            a.textContent = text;
+            a.className = "fc2cmadb-search-btn";
+            a.style.backgroundColor = COLOR_MAP[bgColorClass] || '#6366f1';
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            return a;
+        }
+
+        static cacheResult(key, data, expiryHours = 12) {
+            this._setLRU(key, data);
+            const expiry = Date.now() + expiryHours * 3_600_000;
+            this.storageWriteQueue.set(key, { data, expiry });
+
+            // Debounce persistent writes into idle batches to prevent extension IPC lag
+            if (!this.storageTimer) {
+                this.storageTimer = setTimeout(() => {
+                    this.storageTimer = null;
+                    this._flushStorageQueue();
+                }, 1000);
+            }
+        }
+
+        static async _flushStorageQueue() {
+            if (!this.storageWriteQueue.size) return;
+            const entries = Array.from(this.storageWriteQueue.entries());
+            this.storageWriteQueue.clear();
+            for (const [k, val] of entries) {
+                try { await GM.setValue(k, val); } catch {}
+            }
+        }
+
+        static async getCachedResult(key) {
+            if (this.sessionCache.has(key)) {
+                const v = this.sessionCache.get(key);
+                this._touchLRU(key);
+                return v;
+            }
+            let cached = null;
+            try { cached = await GM.getValue(key, null); } catch {}
+            if (!cached) {
+                this._setLRU(key, null);
+                return null;
+            }
+            if (cached.expiry && cached.expiry < Date.now()) {
+                try { GM.setValue(key, null); } catch {}
+                this._setLRU(key, null);
+                return null;
+            }
+            this._setLRU(key, cached.data);
+            return cached.data;
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Site - Queue & Request Controller
+    // ─────────────────────────────────────────────
+    class Site {
+        constructor(name, searchUrlFunc, responseHandler, buttonColor, queryInterval = 800, maxConcurrentSearches = 2) {
+            this.name = name;
+            this.searchUrlFunc = searchUrlFunc;
+            this.responseHandler = responseHandler;
+            this.buttonColor = buttonColor;
+            this.queryInterval = queryInterval;
+            this.maxConcurrentSearches = maxConcurrentSearches;
+            this.queue = [];
+            this.active = 0;
+        }
+        addToQueue(id, container) {
+            this.queue.push({ id, container });
+            this._schedule();
+        }
+        _schedule() {
+            while (this.queue.length > 0 && this.active < this.maxConcurrentSearches) {
+                const task = this.queue.shift();
+                if (!task.container.isConnected) continue;
+
+                this.active++;
+                const execute = async () => {
+                    try {
+                        await this.search(task.id, task.container);
+                    } catch (e) {
+                        console.error(`[${this.name}]`, e);
+                    } finally {
+                        this.active--;
+                        releaseGlobalSlot();
+                        setTimeout(() => this._schedule(), this.queryInterval);
+                    }
+                };
+                enqueueGlobal(execute);
+            }
+        }
+        async search(id, container) {
+            if (!container.isConnected) return;
+            const cacheKey = `${this.name}_${id}`;
+
+            if (Utils.pendingSearches.has(cacheKey)) {
+                const url = await Utils.pendingSearches.get(cacheKey);
+                if (url && container.isConnected) this.addButton(container, url);
+                return;
+            }
+
+            const cached = await Utils.getCachedResult(cacheKey);
+            if (cached) {
+                if (cached.url && container.isConnected) this.addButton(container, cached.url);
+                return;
+            }
+
+            const searchUrl = this.searchUrlFunc(id);
+            const loadingEl = Utils.showLoading(container, this.name);
+
+            const promise = new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: searchUrl,
+                    timeout: 10000,
+                    headers: { "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+                    onload: (res) => {
+                        if (res.status !== 200) {
+                            Utils.removeLoading(loadingEl);
+                            Utils.cacheResult(cacheKey, { url: '' }, 0.05);
+                            resolve('');
+                            return;
+                        }
+                        const previewData = { url: '' };
+                        try {
+                            this.responseHandler(res, id, previewData);
+                        } catch (e) {
+                            console.error(`[${this.name}] parse`, e);
+                        }
+                        if (previewData.url && container.isConnected) {
+                            this.addButton(container, previewData.url);
+                        }
+                        Utils.removeLoading(loadingEl);
+                        Utils.cacheResult(cacheKey, previewData, previewData.url ? 24 : 12);
+                        resolve(previewData.url);
+                    },
+                    onerror: () => {
+                        Utils.removeLoading(loadingEl);
+                        Utils.cacheResult(cacheKey, { url: '' }, 0.05);
+                        resolve('');
+                    },
+                    ontimeout: () => {
+                        Utils.removeLoading(loadingEl);
+                        Utils.cacheResult(cacheKey, { url: '' }, 0.05);
+                        resolve('');
+                    }
+                });
+            });
+
+            Utils.pendingSearches.set(cacheKey, promise);
+            try {
+                await promise;
+            } finally {
+                Utils.pendingSearches.delete(cacheKey);
+            }
+        }
+        addButton(container, url) {
+            if (!container || !container.isConnected) return;
+            if (container.querySelector(`.fc2cmadb-search-btn[data-site="${this.name}"]`)) return;
+            const btn = Utils.createButton(url, this.name, this.buttonColor);
+            btn.dataset.site = this.name;
+            btn.addEventListener("click", (e) => e.stopPropagation(), { passive: true });
+            container.appendChild(btn);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // SearchManager - Zero-Reflow IntersectionObserver
+    // ─────────────────────────────────────────────
+    class SearchManager {
+        constructor() {
+            this.sites = [];
+            this.activeSites = {};
+            this._domObserver = null;
+            this._lastUrl = location.href;
+            this._spaTimer = null;
+            this._scanScheduled = false;
+            this._detailSeen = '';
+            this._io = null;
+        }
+        addSite(s) { this.sites.push(s); }
+
+        async refreshActiveSites() {
+            const results = await Promise.all(this.sites.map(s => GM.getValue(`site_${s.name}`, true).catch(() => true)));
+            this.sites.forEach((s, i) => this.activeSites[s.name] = results[i]);
+        }
+
+        async start() {
+            await this.refreshActiveSites();
+            this._setupIO();
+            this.scanPage();
+            this._watchDOM();
+            this._watchSPA();
+
+            let scans = 0;
+            const fallbackTimer = setInterval(() => {
+                this.scheduleScan();
+                if (++scans >= 3) clearInterval(fallbackTimer);
+            }, 800);
+        }
+
+        _setupIO() {
+            if (this._io) return;
+            // 600px margin pre-fetches cards comfortably before they enter viewport
+            this._io = new IntersectionObserver((entries) => {
+                for (let i = 0; i < entries.length; i++) {
+                    const e = entries[i];
+                    if (e.isIntersecting) {
+                        const card = e.target;
+                        this._io.unobserve(card);
+                        this._processCard(card);
+                    }
+                }
+            }, { rootMargin: '600px 0px', threshold: 0 });
+        }
+
+        scheduleScan() {
+            if (this._scanScheduled) return;
+            this._scanScheduled = true;
+            const run = () => {
+                this._scanScheduled = false;
+                this.scanPage();
+            };
+            if ('requestIdleCallback' in window) {
+                requestIdleCallback(run, { timeout: 250 });
+            } else {
+                setTimeout(run, 60);
+            }
+        }
+
+        _processCard(card) {
+            if (card.dataset.fc2Searched === '1') return;
+            card.dataset.fc2Searched = '1';
+
+            let id = null;
+            const link = card.querySelector('a[href*="/articles/"]');
+            if (link) {
+                const href = link.getAttribute('href');
+                const m = href ? href.match(RE_ARTICLE_ID) : null;
+                if (m) id = m[1];
+            }
+            if (!id) {
+                const spanEl = card.querySelector("figure span, span.absolute");
+                if (spanEl) {
+                    const text = spanEl.textContent.trim();
+                    if (RE_NUM_5_9.test(text)) id = text;
+                }
+            }
+            if (!id) return;
+
+            let btnBox = card.querySelector(".fc2cmadb-btn-container");
+            if (!btnBox) {
+                btnBox = document.createElement("div");
+                btnBox.className = "fc2cmadb-btn-container";
+                const body = card.querySelector(".card-body") || card;
+                body.appendChild(btnBox);
+            }
+
+            for (let i = 0; i < this.sites.length; i++) {
+                const site = this.sites[i];
+                if (this.activeSites[site.name]) site.addToQueue(id, btnBox);
+            }
+        }
+
+        scanPage() {
+            // Zero-reflow: observe all unsearched cards via IO directly
+            const cards = document.querySelectorAll("div.card:not([data-fc2-searched]), div[class*='card']:not([data-fc2-searched])");
+            for (let i = 0; i < cards.length; i++) {
+                const card = cards[i];
+                if (card.dataset.fc2Searched === '1') continue;
+                if (this._io) {
+                    this._io.observe(card);
+                } else {
+                    this._processCard(card);
+                }
+            }
+
+            // Detail page check
+            const match = location.pathname.match(RE_ARTICLE_ID);
+            if (match) {
+                const id = match[1];
+                if (this._detailSeen === id && document.getElementById("detail-search-buttons")) return;
+                const titleEl = document.querySelector("h1:not([data-searched])");
+                if (titleEl) {
+                    titleEl.dataset.searched = "1";
+                    this._detailSeen = id;
+                    let box = document.getElementById("detail-search-buttons");
+                    if (!box) {
+                        box = document.createElement("div");
+                        box.id = "detail-search-buttons";
+                        box.className = "fc2cmadb-btn-container";
+                        box.style.cssText = "margin-top: 10px; margin-bottom: 10px;";
+                        const anchor = titleEl.closest("a") || titleEl;
+                        anchor.parentNode.insertBefore(box, anchor.nextSibling);
+                        for (let i = 0; i < this.sites.length; i++) {
+                            const site = this.sites[i];
+                            if (this.activeSites[site.name]) site.addToQueue(id, box);
+                        }
+                    }
+                }
+            }
+        }
+
+        _watchDOM() {
+            if (this._domObserver) return;
+            const target = document.querySelector("#app, main, [data-page], body");
+            let debounce = 0;
+
+            this._domObserver = new MutationObserver((mutations) => {
+                let hasRelevantNodes = false;
+                for (let i = 0; i < mutations.length; i++) {
+                    const added = mutations[i].addedNodes;
+                    for (let j = 0; j < added.length; j++) {
+                        const node = added[j];
+                        // Ignore our own injected elements to prevent infinite loops
+                        if (node.nodeType === 1) {
+                            if (node.id === "floating-menu" ||
+                                node.classList?.contains("fc2cmadb-btn-container") ||
+                                node.classList?.contains("fc2cmadb-search-btn") ||
+                                node.classList?.contains("fc2cmadb-loading")) {
+                                continue;
+                            }
+                            hasRelevantNodes = true;
+                            break;
+                        }
+                    }
+                    if (hasRelevantNodes) break;
+                }
+
+                if (!hasRelevantNodes) return;
+                clearTimeout(debounce);
+                debounce = setTimeout(() => this.scheduleScan(), 120);
+            });
+
+            this._domObserver.observe(target, { childList: true, subtree: true });
+        }
+
+        _watchSPA() {
+            const onNavigate = () => {
+                if (location.href === this._lastUrl) return;
+                this._lastUrl = location.href;
+                if (this._io) this._io.disconnect();
+                const oldDetail = document.getElementById("detail-search-buttons");
+                if (oldDetail) oldDetail.remove();
+                const h1 = document.querySelector("h1");
+                if (h1) delete h1.dataset.searched;
+                this._detailSeen = '';
+                clearTimeout(this._spaTimer);
+                this._spaTimer = setTimeout(() => this.scanPage(), 200);
+            };
+
+            const _push = history.pushState.bind(history);
+            const _replace = history.replaceState.bind(history);
+            history.pushState = function (...args) { _push(...args); onNavigate(); };
+            history.replaceState = function (...args) { _replace(...args); onNavigate(); };
+            window.addEventListener("popstate", onNavigate, { passive: true });
+            window.addEventListener("hashchange", onNavigate, { passive: true });
+            document.addEventListener("inertia:finish", onNavigate, { passive: true });
+            document.addEventListener("inertia:navigate", onNavigate, { passive: true });
+            setInterval(onNavigate, 1500);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Bootstrap & Optimized Site Parsers
+    // ─────────────────────────────────────────────
+    const manager = new SearchManager();
+
+    manager.addSite(new Site('_123av',
+        id => `https://123av.com/ja/search?keyword=${numericOnly(id)}`,
+        (res, id, out) => {
+            const cleanId = cleanAlnum(id);
+            if (res.finalUrl) {
+                const cf = cleanAlnum(res.finalUrl);
+                if (cf.includes(cleanId) && !res.finalUrl.includes('search')) {
+                    out.url = res.finalUrl;
+                    return;
+                }
+            }
+            // Fast regex first
+            const direct = fastFindDirectLink(res.responseText, '123av.com', id);
+            if (direct) { out.url = direct; return; }
+
+            // Fallback string search for count
+            if (/(?:[1-9]\d*)\s*(?:视频|件|videos?)/i.test(res.responseText)) {
+                out.url = `https://123av.com/ja/search?keyword=${numericOnly(id)}`;
+            }
+        }, 'bg-blue-500', 800, 2));
+
+    manager.addSite(new Site('MissAV',
+        id => `https://missav.ws/search/${numericOnly(id)}`,
+        (res, id, out) => {
+            const cleanId = cleanAlnum(id);
+            if (res.finalUrl) {
+                const cf = cleanAlnum(res.finalUrl);
+                if (cf.includes(cleanId) && !res.finalUrl.includes('/search')) {
+                    out.url = res.finalUrl;
+                    return;
+                }
+            }
+            const direct = fastFindDirectLink(res.responseText, 'missav.ws', id);
+            if (direct) { out.url = direct; return; }
+
+            // DOM fallback if regex missed
+            const doc = getParser().parseFromString(res.responseText, "text/html");
+            const fallback = fallbackFindDirectLink(doc, 'missav.ws', id);
+            if (fallback) out.url = fallback;
+        }, 'bg-green-500', 800, 2));
+
+    manager.addSite(new Site('7MMTV',
+        id => `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(numericOnly(id))}&search_type=searchall&op=search`,
+        (res, id, out) => {
+            const cleanNum = numericOnly(id);
+            const esc = cleanNum.replace(RE_ESCAPE, '\\$&');
+            const match = res.responseText.match(new RegExp(`搜索 "${esc}" \\((\\d+)\\)`));
+            if (match && parseInt(match[1], 10) > 0) {
+                out.url = `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(cleanNum)}`;
+                return;
+            }
+            const direct = fastFindDirectLink(res.responseText, '7mmtv.sx', id);
+            if (direct) out.url = direct;
+        }, 'bg-red-500', 800, 2));
+
+    manager.addSite(new Site('JAVFC2',
+        id => `https://javfc2.xyz/?s=${numericOnly(id)}`,
+        (res, id, out) => {
+            const direct = fastFindDirectLink(res.responseText, 'javfc2.xyz', id);
+            if (direct) { out.url = direct; return; }
+
+            if (res.responseText.includes("Nothing found") ||
+                res.responseText.includes("No results") ||
+                res.responseText.includes("not-found")) {
+                return;
+            }
+            out.url = `https://javfc2.xyz/?s=${numericOnly(id)}`;
+        }, 'bg-purple-500', 800, 2));
+
+    manager.addSite(new Site('Sukebei',
+        id => `https://sukebei.nyaa.si/?page=rss&q=${encodeURIComponent(numericOnly(id))}&c=0_0&f=0`,
+        (res, id, out) => {
+            // Zero-DOM: Simple text check eliminates redundant XML parsing
+            if (res.responseText.includes('<item')) {
+                out.url = `https://sukebei.nyaa.si/?f=0&c=0_0&q=${encodeURIComponent(numericOnly(id))}&s=seeders&o=desc`;
+            }
+        }, 'bg-yellow-500', 1500, 1));
+
+    manager.addSite(new Site('SupJav',
+        id => `https://supjav.com/?s=${numericOnly(id)}`,
+        (res, id, out) => {
+            const cleanId = cleanAlnum(id);
+            if (res.finalUrl) {
+                const cf = cleanAlnum(res.finalUrl);
+                if (cf.includes(cleanId) && !res.finalUrl.includes('?s=')) {
+                    out.url = res.finalUrl;
+                    return;
+                }
+            }
+            const direct = fastFindDirectLink(res.responseText, 'supjav.com', id);
+            if (direct) { out.url = direct; return; }
+
+            // Heading & post match in raw text
+            if (res.responseText.includes('searchresultfor') || res.responseText.includes('post')) {
+                const match = res.responseText.match(/\((\d+)\)/);
+                if (match && parseInt(match[1], 10) > 0) {
+                    out.url = `https://supjav.com/?s=${numericOnly(id)}`;
+                    return;
+                }
+                if (cleanAlnum(res.responseText).includes(cleanId)) {
+                    out.url = `https://supjav.com/?s=${numericOnly(id)}`;
+                }
+            }
+        }, 'bg-orange-500', 1200, 1));
+
+    // Initialize UI and Manager
+    const floatingMenu = new FloatingMenu("搜尋開關");
+    (async () => {
+        await manager.refreshActiveSites();
+        const frag = document.createDocumentFragment();
+
+        for (let i = 0; i < manager.sites.length; i++) {
+            const site = manager.sites[i];
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.id = `checkbox_${site.name}`;
+            cb.checked = manager.activeSites[site.name];
+            cb.addEventListener("change", async () => {
+                await GM.setValue(`site_${site.name}`, cb.checked);
+                manager.activeSites[site.name] = cb.checked;
+                if (cb.checked) manager.scheduleScan();
+            });
+
+            const label = document.createElement("label");
+            label.textContent = site.name;
+            label.htmlFor = `checkbox_${site.name}`;
+
+            const row = document.createElement("div");
+            row.className = "menu-item";
+            row.appendChild(cb);
+            row.appendChild(label);
+            row.addEventListener("click", (e) => { if (e.target !== cb) cb.click(); });
+            frag.appendChild(row);
+        }
+
+        floatingMenu.addContent(frag);
+        manager.start();
+    })();
+})();// ==UserScript==
+// @name        New script fc2cmadb.com
+// @namespace   Violentmonkey Scripts
+// @icon        https://fc2cmadb.com/favicon.ico
+// @version     1.0.0
+//
+// @match       https://fc2cmadb.com/*
+// @grant       none
+//
+// @author      -
+// @description
+// ==/UserScript==
