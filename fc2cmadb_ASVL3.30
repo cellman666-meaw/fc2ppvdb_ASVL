@@ -857,15 +857,4 @@
         floatingMenu.addContent(frag);
         manager.start();
     })();
-})();// ==UserScript==
-// @name        New script fc2cmadb.com
-// @namespace   Violentmonkey Scripts
-// @icon        https://fc2cmadb.com/favicon.ico
-// @version     1.0.0
-//
-// @match       https://fc2cmadb.com/*
-// @grant       none
-//
-// @author      -
-// @description
-// ==/UserScript==
+})();
