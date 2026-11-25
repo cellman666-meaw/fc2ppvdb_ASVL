@@ -1,0 +1,1051 @@
+// ==UserScript==
+// @name         FC2CMADB 自動搜尋並添加鏈接
+// @namespace    fc2cmadb_ASVL3.40
+// @version      3.40.0
+// @description  自動搜尋多個網站，並在頁面左側添加可拖動開關選單以防止 Rate-Limit。支援無限捲動與 SPA 換頁。(v3.40 Ultra-Perf: Sync Unified Cache, Two-Pass Zero-DOM Scanner, Abortable Round-Robin Queue, RAF Batching)
+// @author       jjbigjj, Antigravity
+// @match        *://fc2cmadb.com/*
+// @match        *://*.fc2cmadb.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM.setValue
+// @grant        GM.getValue
+// @run-at       document-end
+// @connect      123av.com
+// @connect      missav.ws
+// @connect      missav.ai
+// @connect      missav.com
+// @connect      7mmtv.sx
+// @connect      7mmtv.tv
+// @connect      javfc2.xyz
+// @connect      sukebei.nyaa.si
+// @connect      supjav.com
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ─────────────────────────────────────────────
+  // Constants & Precompiled Regex Pool
+  // ─────────────────────────────────────────────
+  const RE_NON_ALNUM = /[^a-z0-9]/g;
+  const RE_NON_NUM = /[^0-9]/g;
+  const RE_ARTICLE_ID = /\/articles\/(\d+)/;
+  const RE_NUM_5_9 = /^\d{5,9}$/;
+  const RE_OPEN_A = /<a\b([^>]+)>/gi;
+  const RE_HREF_ATTR = /\bhref=(?:["']([^"']+)["']|([^\s>"']+))/i;
+  const RE_TITLE_ATTR = /\btitle=["']([^"']+)["']/i;
+  const RE_BOUNDED_A = /<a\b([^>]+)>((?:(?!<a\b)[\s\S]){1,2500}?)<\/a>/gi;
+  const RE_123AV_COUNT = /(?:[1-9]\d*)\s*(?:视频|件|videos?)/i;
+  const RE_SUPJAV_COUNT = /<h1[^>]*>[^<]*\((\d+)\)/i;
+
+  const GLOBAL_MAX_CONCURRENT = 6;
+  const CACHE_STORAGE_KEY = 'fc2_unified_cache_v340';
+  const MAX_CACHE_ENTRIES = 3000;
+
+  const COLOR_MAP = {
+    'bg-blue-500': '#3b82f6',
+    'bg-green-500': '#10b981',
+    'bg-red-500': '#ef4444',
+    'bg-purple-500': '#8b5cf6',
+    'bg-yellow-500': '#eab308',
+    'bg-orange-500': '#f97316',
+    'bg-gray-500': '#64748b'
+  };
+
+  // ─────────────────────────────────────────────
+  // Styles Injection (Strict Containment & Idle-GPU Friendly)
+  // ─────────────────────────────────────────────
+  const style = document.createElement('style');
+  style.textContent = `
+    #floating-menu {
+      position: fixed;
+      top: 50%;
+      left: 0;
+      transform: translate3d(0, -50%, 0);
+      width: 220px;
+      background: rgba(15, 23, 42, 0.94) !important;
+      backdrop-filter: blur(10px) saturate(160%);
+      -webkit-backdrop-filter: blur(10px) saturate(160%);
+      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      border-left: none !important;
+      color: #f8fafc !important;
+      padding: 16px !important;
+      border-radius: 0 16px 16px 0 !important;
+      z-index: 100000 !important;
+      box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5) !important;
+      font-family: system-ui, -apple-system, sans-serif !important;
+      contain: layout paint style;
+      user-select: none;
+    }
+    #floating-menu-title {
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+      cursor: grab;
+      text-align: center;
+      color: #60a5fa !important;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      padding-bottom: 8px;
+      transition: color 0.15s;
+    }
+    #floating-menu-title:hover { color: #93c5fd !important; }
+    #floating-menu-content { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+    .menu-item { display: flex; align-items: center; padding: 6px 8px; border-radius: 8px; transition: background-color 0.15s; cursor: pointer; }
+    .menu-item:hover { background-color: rgba(255, 255, 255, 0.06); }
+    .menu-item input[type="checkbox"] { margin-right: 10px; cursor: pointer; accent-color: #3b82f6; width: 14px; height: 14px; }
+    .menu-item label { cursor: pointer; font-size: 13px; font-weight: 500; color: #e2e8f0; flex-grow: 1; }
+    .fc2cmadb-btn-container { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; z-index: 10; position: relative; contain: layout style; }
+    .fc2cmadb-search-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 11px !important; font-weight: 600 !important; color: #ffffff !important;
+      padding: 3px 7px !important; border-radius: 6px !important; text-decoration: none !important;
+      transition: transform 0.15s, box-shadow 0.15s, filter 0.15s !important;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15) !important; border: none !important; cursor: pointer; line-height: 1.4;
+    }
+    .fc2cmadb-search-btn:hover { transform: translateY(-1px) !important; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.25) !important; filter: brightness(1.15) !important; }
+    .fc2cmadb-loading { display: inline-flex; align-items: center; font-size: 11px !important; color: #94a3b8 !important; font-style: italic; animation: cmapulse 1.5s infinite; padding: 2px 4px; }
+    @keyframes cmapulse { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
+  `;
+  document.head.appendChild(style);
+
+  // ─────────────────────────────────────────────
+  // RAF DOM Batcher & Fast Queue
+  // ─────────────────────────────────────────────
+  const domTasks = [];
+  let domRafId = 0;
+
+  function scheduleDOM(fn) {
+    domTasks.push(fn);
+    if (!domRafId) {
+      domRafId = requestAnimationFrame(() => {
+        domRafId = 0;
+        const batch = domTasks.splice(0, domTasks.length);
+        for (let i = 0; i < batch.length; i++) batch[i]();
+      });
+    }
+  }
+
+  class FastQueue {
+    constructor() {
+      this.items = [];
+      this.head = 0;
+    }
+    get size() {
+      return this.items.length - this.head;
+    }
+    push(item) {
+      this.items.push(item);
+    }
+    shift() {
+      if (this.head >= this.items.length) return undefined;
+      const item = this.items[this.head];
+      this.items[this.head++] = undefined;
+      if (this.head > 64 && this.head * 2 >= this.items.length) {
+        this.items = this.items.slice(this.head);
+        this.head = 0;
+      }
+      return item;
+    }
+    clear() {
+      this.items.length = 0;
+      this.head = 0;
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // High-Performance String & Link Scanners (100% Zero-DOM)
+  // ─────────────────────────────────────────────
+  const cleanAlnum = (s) => (s ? s.toLowerCase().replace(RE_NON_ALNUM, '') : '');
+  const numericOnly = (s) => (s ? s.replace(RE_NON_NUM, '') || s : '');
+
+  function resolveAbsoluteUrl(href, domain) {
+    if (!href) return '';
+    if (href.startsWith('http://') || href.startsWith('https://')) return href;
+    return `https://${domain}/${href.charCodeAt(0) === 47 ? href.slice(1) : href}`;
+  }
+
+  function isCandidateHref(rawHref, hrefLower, domain) {
+    if (!rawHref || hrefLower === '#' || hrefLower === '/' || hrefLower.startsWith('javascript:')) return false;
+    const c0 = rawHref.charCodeAt(0);
+    if (c0 !== 47 && c0 !== 46 && !hrefLower.includes(domain)) return false;
+    if (
+      hrefLower.includes('?s=') ||
+      hrefLower.includes('keyword=') ||
+      hrefLower.includes('search') ||
+      hrefLower.includes('/category/') ||
+      hrefLower.includes('/tag/') ||
+      hrefLower.includes('/page/') ||
+      hrefLower.includes('/genre/')
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  function fastFindDirectLink(html, domain, id) {
+    const cleanId = cleanAlnum(id);
+    if (!cleanId || !html) return null;
+
+    // Pass 1: Linear O(N) opening-tag scan (checks href and title attributes with zero backtracking)
+    RE_OPEN_A.lastIndex = 0;
+    let match;
+    let count = 0;
+    while ((match = RE_OPEN_A.exec(html)) !== null && count++ < 500) {
+      const attrs = match[1];
+      const hm = RE_HREF_ATTR.exec(attrs);
+      if (!hm) continue;
+      const rawHref = hm[1] || hm[2];
+      const hrefLower = rawHref.toLowerCase();
+      if (!isCandidateHref(rawHref, hrefLower, domain)) continue;
+
+      if (hrefLower.replace(RE_NON_ALNUM, '').includes(cleanId)) {
+        return resolveAbsoluteUrl(rawHref, domain);
+      }
+      const tm = RE_TITLE_ATTR.exec(attrs);
+      if (tm && tm[1].toLowerCase().replace(RE_NON_ALNUM, '').includes(cleanId)) {
+        return resolveAbsoluteUrl(rawHref, domain);
+      }
+    }
+
+    // Fast exit before Pass 2 if numeric ID isn't present in document at all
+    const numId = numericOnly(id);
+    if (numId && !html.includes(numId)) return null;
+
+    // Pass 2: Bounded inner-HTML scan (catches inner text and <img alt="..."> safely)
+    RE_BOUNDED_A.lastIndex = 0;
+    count = 0;
+    while ((match = RE_BOUNDED_A.exec(html)) !== null && count++ < 300) {
+      const hm = RE_HREF_ATTR.exec(match[1]);
+      if (!hm) continue;
+      const rawHref = hm[1] || hm[2];
+      const hrefLower = rawHref.toLowerCase();
+      if (!isCandidateHref(rawHref, hrefLower, domain)) continue;
+
+      const innerHtml = match[2];
+      if (innerHtml && innerHtml.toLowerCase().replace(RE_NON_ALNUM, '').includes(cleanId)) {
+        return resolveAbsoluteUrl(rawHref, domain);
+      }
+    }
+    return null;
+  }
+
+  // ─────────────────────────────────────────────
+  // Unified Synchronous Memory + Single-Key Persistent Cache
+  // ─────────────────────────────────────────────
+  class CacheStore {
+    static mem = new Map();
+    static dirty = false;
+    static flushTimer = 0;
+
+    static async init() {
+      try {
+        const saved = await GM.getValue(CACHE_STORAGE_KEY, null);
+        if (saved && typeof saved === 'object') {
+          const now = Date.now();
+          const keys = Object.keys(saved);
+          for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            const entry = saved[k];
+            if (entry && entry.e > now) {
+              this.mem.set(k, entry);
+            } else {
+              this.dirty = true;
+            }
+          }
+        }
+      } catch {}
+
+      if (this.dirty) this.scheduleFlush();
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') this.flushNow();
+      }, { passive: true });
+    }
+
+    static get(key) {
+      const entry = this.mem.get(key);
+      if (!entry) return undefined;
+      if (entry.e <= Date.now()) {
+        this.mem.delete(key);
+        this.dirty = true;
+        this.scheduleFlush();
+        return undefined;
+      }
+      this.mem.delete(key);
+      this.mem.set(key, entry);
+      return entry.u;
+    }
+
+    static set(key, url, expiryHours = 12) {
+      if (this.mem.has(key)) {
+        this.mem.delete(key);
+      } else if (this.mem.size >= MAX_CACHE_ENTRIES) {
+        const oldest = this.mem.keys().next().value;
+        this.mem.delete(oldest);
+      }
+      this.mem.set(key, { u: url || '', e: Date.now() + expiryHours * 3_600_000 });
+      this.dirty = true;
+      this.scheduleFlush();
+    }
+
+    static scheduleFlush() {
+      if (this.flushTimer) return;
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = 0;
+        if ('requestIdleCallback' in window) {
+          requestIdleCallback(() => this.flushNow(), { timeout: 1500 });
+        } else {
+          this.flushNow();
+        }
+      }, 2000);
+    }
+
+    static flushNow() {
+      if (!this.dirty) return;
+      this.dirty = false;
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = 0;
+      }
+      const out = Object.create(null);
+      const now = Date.now();
+      for (const [k, v] of this.mem) {
+        if (v.e > now) out[k] = v;
+      }
+      GM.setValue(CACHE_STORAGE_KEY, out).catch(() => {});
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // FloatingMenu - On-Demand Drag Listeners
+  // ─────────────────────────────────────────────
+  class FloatingMenu {
+    constructor(titleText) {
+      this.isDragging = false;
+      this.wasDragged = false;
+      this.startX = 0;
+      this.startY = 0;
+      this.currentX = 0;
+      this.currentY = 0;
+      this.rafId = 0;
+      this._createMenu(titleText);
+    }
+
+    _createMenu(titleText) {
+      this.menu = document.createElement('div');
+      this.menu.id = 'floating-menu';
+
+      this.title = document.createElement('div');
+      this.title.id = 'floating-menu-title';
+      this.title.textContent = `🔍 ${titleText}`;
+
+      this.content = document.createElement('div');
+      this.content.id = 'floating-menu-content';
+      this.content.style.display = 'none';
+
+      this.menu.appendChild(this.title);
+      this.menu.appendChild(this.content);
+      document.body.appendChild(this.menu);
+
+      this._bindEvents();
+    }
+
+    _bindEvents() {
+      this.title.addEventListener('click', () => {
+        if (this.wasDragged) {
+          this.wasDragged = false;
+          return;
+        }
+        this.content.style.display = this.content.style.display === 'none' ? 'flex' : 'none';
+      });
+
+      const onMove = (e) => {
+        if (!this.isDragging) return;
+        this.wasDragged = true;
+        this.currentX = e.clientX - this.startX;
+        this.currentY = e.clientY - this.startY;
+        if (!this.rafId) {
+          this.rafId = requestAnimationFrame(() => {
+            this.rafId = 0;
+            this.menu.style.transform = `translate3d(${this.currentX}px, calc(-50% + ${this.currentY}px), 0)`;
+          });
+        }
+      };
+
+      const onUp = () => {
+        if (!this.isDragging) return;
+        this.isDragging = false;
+        this.title.style.cursor = 'grab';
+        this.menu.style.willChange = 'auto';
+        document.body.style.userSelect = '';
+        if (this.rafId) {
+          cancelAnimationFrame(this.rafId);
+          this.rafId = 0;
+        }
+        this.title.removeEventListener('pointermove', onMove);
+        this.title.removeEventListener('pointerup', onUp);
+        this.title.removeEventListener('pointercancel', onUp);
+        if (this.wasDragged) {
+          setTimeout(() => { this.wasDragged = false; }, 100);
+        }
+      };
+
+      this.title.addEventListener('pointerdown', (e) => {
+        this.isDragging = true;
+        this.wasDragged = false;
+        this.startX = e.clientX - this.currentX;
+        this.startY = e.clientY - this.currentY;
+        this.menu.style.willChange = 'transform';
+        this.title.style.cursor = 'grabbing';
+        document.body.style.userSelect = 'none';
+        this.title.setPointerCapture(e.pointerId);
+        this.title.addEventListener('pointermove', onMove, { passive: true });
+        this.title.addEventListener('pointerup', onUp);
+        this.title.addEventListener('pointercancel', onUp);
+        e.preventDefault();
+      });
+    }
+
+    addContent(el) {
+      this.content.appendChild(el);
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // Global Round-Robin Scheduler & Site Controller
+  // ─────────────────────────────────────────────
+  let globalActive = 0;
+  let navEpoch = 0;
+  let rrCursor = 0;
+  const allSites = [];
+  const pendingSearches = new Map();
+
+  function pumpQueues() {
+    const totalSites = allSites.length;
+    if (!totalSites || globalActive >= GLOBAL_MAX_CONCURRENT) return;
+
+    const now = Date.now();
+    let progressed = true;
+
+    while (globalActive < GLOBAL_MAX_CONCURRENT && progressed) {
+      progressed = false;
+
+      for (let step = 0; step < totalSites && globalActive < GLOBAL_MAX_CONCURRENT; step++) {
+        const idx = (rrCursor + step) % totalSites;
+        const site = allSites[idx];
+
+        if (!site.enabled || site.active >= site.maxConcurrent || site.queue.size === 0) continue;
+
+        if (now < site.nextAllowedAt) {
+          site._ensureCooldownTimer(site.nextAllowedAt - now);
+          continue;
+        }
+
+        const task = site._dequeueValidTask();
+        if (!task) continue;
+
+        rrCursor = (idx + 1) % totalSites;
+        progressed = true;
+        site._runNetworkTask(task);
+      }
+    }
+  }
+
+  class Site {
+    constructor(name, searchUrlFunc, responseHandler, buttonColor, queryInterval = 800, maxConcurrent = 2) {
+      this.name = name;
+      this.searchUrlFunc = searchUrlFunc;
+      this.responseHandler = responseHandler;
+      this.bgHex = COLOR_MAP[buttonColor] || '#6366f1';
+      this.queryInterval = queryInterval;
+      this.maxConcurrent = maxConcurrent;
+      this.queue = new FastQueue();
+      this.active = 0;
+      this.enabled = true;
+      this.nextAllowedAt = 0;
+      this.cooldownTimer = 0;
+      this.inFlightXhrs = new Set();
+    }
+
+    _ensureCooldownTimer(delay) {
+      if (this.cooldownTimer) return;
+      this.cooldownTimer = setTimeout(() => {
+        this.cooldownTimer = 0;
+        pumpQueues();
+      }, Math.max(16, delay));
+    }
+
+    cancelAll() {
+      this.queue.clear();
+      if (this.cooldownTimer) {
+        clearTimeout(this.cooldownTimer);
+        this.cooldownTimer = 0;
+      }
+      for (const item of this.inFlightXhrs) {
+        try { item.req.abort(); } catch {}
+        item.cleanupLoading();
+      }
+      this.inFlightXhrs.clear();
+    }
+
+    enqueue(id, container) {
+      if (!this.enabled || !container || !container.isConnected) return;
+      if (!container._fc2Done) container._fc2Done = new Set();
+      if (container._fc2Done.has(this.name)) return;
+
+      const cacheKey = `${this.name}_${id}`;
+
+      // 1. Instant Synchronous Cache Fast-Path (0ms, bypasses queue & timers)
+      const cachedUrl = CacheStore.get(cacheKey);
+      if (cachedUrl !== undefined) {
+        if (cachedUrl) this.addButton(container, cachedUrl);
+        return;
+      }
+
+      // 2. Deduplicate Identical In-Flight Requests
+      if (pendingSearches.has(cacheKey)) {
+        pendingSearches.get(cacheKey).then((url) => {
+          if (url && this.enabled && container.isConnected) this.addButton(container, url);
+        });
+        return;
+      }
+
+      this.queue.push({ id, container, epoch: navEpoch });
+      pumpQueues();
+    }
+
+    _dequeueValidTask() {
+      while (this.queue.size > 0) {
+        const task = this.queue.shift();
+        if (!task || task.epoch !== navEpoch || !task.container.isConnected) continue;
+        if (task.container._fc2Done?.has(this.name)) continue;
+
+        const cacheKey = `${this.name}_${task.id}`;
+        const cachedUrl = CacheStore.get(cacheKey);
+        if (cachedUrl !== undefined) {
+          if (cachedUrl) this.addButton(task.container, cachedUrl);
+          continue;
+        }
+        if (pendingSearches.has(cacheKey)) {
+          pendingSearches.get(cacheKey).then((url) => {
+            if (url && this.enabled && task.container.isConnected) this.addButton(task.container, url);
+          });
+          continue;
+        }
+        return task;
+      }
+      return null;
+    }
+
+    _runNetworkTask(task) {
+      const { id, container, epoch } = task;
+      const cacheKey = `${this.name}_${id}`;
+      const stepDelay = Math.ceil(this.queryInterval / this.maxConcurrent);
+
+      this.active++;
+      globalActive++;
+      this.nextAllowedAt = Math.max(Date.now(), this.nextAllowedAt) + stepDelay;
+
+      let loadingEl = null;
+      let finished = false;
+
+      scheduleDOM(() => {
+        if (finished || !this.enabled || !container.isConnected) return;
+        loadingEl = document.createElement('span');
+        loadingEl.textContent = `🔍 [${this.name}]...`;
+        loadingEl.className = 'fc2cmadb-loading';
+        container.appendChild(loadingEl);
+      });
+
+      const cleanupLoading = () => {
+        finished = true;
+        if (loadingEl) {
+          const el = loadingEl;
+          loadingEl = null;
+          scheduleDOM(() => { if (el.parentNode) el.remove(); });
+        }
+      };
+
+      let tracker = null;
+      const promise = new Promise((resolve) => {
+        const req = GM_xmlhttpRequest({
+          method: 'GET',
+          url: this.searchUrlFunc(id),
+          timeout: 10000,
+          headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+          onload: (res) => {
+            cleanupLoading();
+            if (epoch !== navEpoch || !this.enabled) {
+              resolve('');
+              return;
+            }
+            if (res.status !== 200) {
+              CacheStore.set(cacheKey, '', 0.05);
+              resolve('');
+              return;
+            }
+            const previewData = { url: '' };
+            try {
+              this.responseHandler(res, id, previewData);
+            } catch (e) {
+              console.error(`[${this.name}] parse error:`, e);
+            }
+            if (previewData.url && container.isConnected) {
+              this.addButton(container, previewData.url);
+            }
+            CacheStore.set(cacheKey, previewData.url, previewData.url ? 24 : 12);
+            resolve(previewData.url);
+          },
+          onerror: () => {
+            cleanupLoading();
+            if (epoch === navEpoch && this.enabled) CacheStore.set(cacheKey, '', 0.05);
+            resolve('');
+          },
+          ontimeout: () => {
+            cleanupLoading();
+            if (epoch === navEpoch && this.enabled) CacheStore.set(cacheKey, '', 0.05);
+            resolve('');
+          }
+        });
+
+        tracker = { req, cleanupLoading };
+        if (req && typeof req.abort === 'function') {
+          this.inFlightXhrs.add(tracker);
+        }
+      });
+
+      pendingSearches.set(cacheKey, promise);
+      promise.finally(() => {
+        if (tracker) this.inFlightXhrs.delete(tracker);
+        pendingSearches.delete(cacheKey);
+        this.active = Math.max(0, this.active - 1);
+        globalActive = Math.max(0, globalActive - 1);
+        this.nextAllowedAt = Math.max(this.nextAllowedAt, Date.now() + stepDelay);
+        pumpQueues();
+      });
+    }
+
+    addButton(container, url) {
+      if (!container || !container.isConnected) return;
+      if (!container._fc2Done) container._fc2Done = new Set();
+      if (container._fc2Done.has(this.name)) return;
+      container._fc2Done.add(this.name);
+
+      scheduleDOM(() => {
+        if (!container.isConnected) return;
+        const a = document.createElement('a');
+        a.href = url;
+        a.textContent = this.name;
+        a.className = 'fc2cmadb-search-btn';
+        a.dataset.site = this.name;
+        a.style.backgroundColor = this.bgHex;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.addEventListener('click', (e) => e.stopPropagation(), { passive: true });
+        container.appendChild(a);
+      });
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // SearchManager - Zero-Reflow IO & Live Site Toggle
+  // ─────────────────────────────────────────────
+  class SearchManager {
+    constructor() {
+      this.sites = allSites;
+      this._containers = new Map();
+      this._domObserver = null;
+      this._lastUrl = location.href;
+      this._spaTimer = 0;
+      this._scanScheduled = false;
+      this._detailSeen = '';
+      this._io = null;
+    }
+
+    addSite(site) {
+      this.sites.push(site);
+    }
+
+    async refreshActiveSites() {
+      const states = await Promise.all(
+        this.sites.map((s) => GM.getValue(`site_${s.name}`, true).catch(() => true))
+      );
+      for (let i = 0; i < this.sites.length; i++) {
+        this.sites[i].enabled = Boolean(states[i]);
+      }
+    }
+
+    toggleSite(site, enabled) {
+      site.enabled = enabled;
+      if (!enabled) {
+        site.cancelAll();
+        return;
+      }
+      for (const [box, id] of this._containers) {
+        if (!box.isConnected) {
+          this._containers.delete(box);
+        } else {
+          site.enqueue(id, box);
+        }
+      }
+      this.scheduleScan();
+    }
+
+    start() {
+      this._setupIO();
+      this.scanPage();
+      this._watchDOM();
+      this._watchSPA();
+
+      let scans = 0;
+      const fallbackTimer = setInterval(() => {
+        this.scheduleScan();
+        if (++scans >= 2) clearInterval(fallbackTimer);
+      }, 900);
+    }
+
+    _setupIO() {
+      if (this._io) return;
+      this._io = new IntersectionObserver((entries) => {
+        for (let i = 0; i < entries.length; i++) {
+          const e = entries[i];
+          if (e.isIntersecting) {
+            const card = e.target;
+            this._io.unobserve(card);
+            this._processCard(card);
+          }
+        }
+      }, { rootMargin: '500px 0px', threshold: 0 });
+    }
+
+    scheduleScan() {
+      if (this._scanScheduled) return;
+      this._scanScheduled = true;
+      const run = () => {
+        this._scanScheduled = false;
+        this.scanPage();
+      };
+      if ('requestIdleCallback' in window) {
+        requestIdleCallback(run, { timeout: 200 });
+      } else {
+        setTimeout(run, 50);
+      }
+    }
+
+    _registerAndEnqueue(id, box) {
+      this._containers.set(box, id);
+      for (let i = 0; i < this.sites.length; i++) {
+        const site = this.sites[i];
+        if (site.enabled) site.enqueue(id, box);
+      }
+    }
+
+    _processCard(card) {
+      if (card.dataset.fc2Searched === '1') return;
+      card.dataset.fc2Searched = '1';
+
+      let id = null;
+      const link = card.querySelector('a[href*="/articles/"]');
+      if (link) {
+        const href = link.getAttribute('href');
+        const m = href ? RE_ARTICLE_ID.exec(href) : null;
+        if (m) id = m[1];
+      }
+      if (!id) {
+        const spanEl = card.querySelector('figure span, span.absolute');
+        if (spanEl) {
+          const text = spanEl.textContent.trim();
+          if (RE_NUM_5_9.test(text)) id = text;
+        }
+      }
+      if (!id) return;
+
+      let btnBox = card.querySelector('.fc2cmadb-btn-container');
+      if (!btnBox) {
+        btnBox = document.createElement('div');
+        btnBox.className = 'fc2cmadb-btn-container';
+        const body = card.querySelector('.card-body') || card;
+        body.appendChild(btnBox);
+      }
+
+      this._registerAndEnqueue(id, btnBox);
+    }
+
+    scanPage() {
+      // Primary fast class-indexed query; fallback excludes inner .card-body & outer wrappers
+      let cards = document.querySelectorAll('div.card:not([data-fc2-searched])');
+      if (cards.length === 0) {
+        cards = document.querySelectorAll('div[class*="card"]:not([data-fc2-searched]):not(.card-body)');
+      }
+
+      for (let i = 0; i < cards.length; i++) {
+        const card = cards[i];
+        if (card.dataset.fc2Searched === '1') continue;
+        if (card.querySelector('div.card')) continue;
+        if (this._io) {
+          this._io.observe(card);
+        } else {
+          this._processCard(card);
+        }
+      }
+
+      // Detail page check
+      const match = RE_ARTICLE_ID.exec(location.pathname);
+      if (match) {
+        const id = match[1];
+        if (this._detailSeen === id && document.getElementById('detail-search-buttons')) return;
+        const titleEl = document.querySelector('h1:not([data-searched])');
+        if (titleEl) {
+          titleEl.dataset.searched = '1';
+          this._detailSeen = id;
+          let box = document.getElementById('detail-search-buttons');
+          if (!box) {
+            box = document.createElement('div');
+            box.id = 'detail-search-buttons';
+            box.className = 'fc2cmadb-btn-container';
+            box.style.cssText = 'margin-top: 10px; margin-bottom: 10px;';
+            const anchor = titleEl.closest('a') || titleEl;
+            anchor.parentNode.insertBefore(box, anchor.nextSibling);
+          }
+          this._registerAndEnqueue(id, box);
+        }
+      }
+    }
+
+    _watchDOM() {
+      if (this._domObserver) return;
+      const target = document.querySelector('#app, main, [data-page]') || document.body;
+      let debounce = 0;
+
+      this._domObserver = new MutationObserver((mutations) => {
+        let hasRelevantNodes = false;
+        for (let i = 0; i < mutations.length && !hasRelevantNodes; i++) {
+          const added = mutations[i].addedNodes;
+          for (let j = 0; j < added.length; j++) {
+            const node = added[j];
+            if (node.nodeType !== 1) continue;
+            const cl = node.classList;
+            if (
+              node.id === 'floating-menu' ||
+              (cl && (
+                cl.contains('fc2cmadb-btn-container') ||
+                cl.contains('fc2cmadb-search-btn') ||
+                cl.contains('fc2cmadb-loading')
+              ))
+            ) {
+              continue;
+            }
+            hasRelevantNodes = true;
+            break;
+          }
+        }
+        if (!hasRelevantNodes) return;
+        clearTimeout(debounce);
+        debounce = setTimeout(() => this.scheduleScan(), 100);
+      });
+
+      this._domObserver.observe(target, { childList: true, subtree: true });
+    }
+
+    _watchSPA() {
+      const onNavigate = () => {
+        if (location.href === this._lastUrl) return;
+        this._lastUrl = location.href;
+        navEpoch++;
+        this._containers.clear();
+        for (let i = 0; i < this.sites.length; i++) {
+          this.sites[i].cancelAll();
+        }
+        if (this._io) this._io.disconnect();
+
+        const oldDetail = document.getElementById('detail-search-buttons');
+        if (oldDetail) oldDetail.remove();
+        const h1 = document.querySelector('h1');
+        if (h1) delete h1.dataset.searched;
+        this._detailSeen = '';
+
+        clearTimeout(this._spaTimer);
+        this._spaTimer = setTimeout(() => this.scanPage(), 150);
+      };
+
+      const _push = history.pushState.bind(history);
+      const _replace = history.replaceState.bind(history);
+      history.pushState = function (...args) { _push(...args); onNavigate(); };
+      history.replaceState = function (...args) { _replace(...args); onNavigate(); };
+      window.addEventListener('popstate', onNavigate, { passive: true });
+      window.addEventListener('hashchange', onNavigate, { passive: true });
+      document.addEventListener('inertia:finish', onNavigate, { passive: true });
+      document.addEventListener('inertia:navigate', onNavigate, { passive: true });
+
+      setInterval(() => {
+        if (document.visibilityState === 'visible') onNavigate();
+      }, 2500);
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // Site Configurations & Optimized Parsers
+  // ─────────────────────────────────────────────
+  const manager = new SearchManager();
+
+  manager.addSite(new Site(
+    '_123av',
+    (id) => `https://123av.com/ja/search?keyword=${numericOnly(id)}`,
+    (res, id, out) => {
+      const cleanId = cleanAlnum(id);
+      if (res.finalUrl && !res.finalUrl.includes('search') && cleanAlnum(res.finalUrl).includes(cleanId)) {
+        out.url = res.finalUrl;
+        return;
+      }
+      const html = res.responseText;
+      const direct = fastFindDirectLink(html, '123av.com', id);
+      if (direct) {
+        out.url = direct;
+        return;
+      }
+      if (RE_123AV_COUNT.test(html)) {
+        out.url = `https://123av.com/ja/search?keyword=${numericOnly(id)}`;
+      }
+    },
+    'bg-blue-500', 800, 2
+  ));
+
+  manager.addSite(new Site(
+    'MissAV',
+    (id) => `https://missav.ws/search/${numericOnly(id)}`,
+    (res, id, out) => {
+      const cleanId = cleanAlnum(id);
+      if (res.finalUrl && !res.finalUrl.includes('/search') && cleanAlnum(res.finalUrl).includes(cleanId)) {
+        out.url = res.finalUrl;
+        return;
+      }
+      const direct = fastFindDirectLink(res.responseText, 'missav.ws', id);
+      if (direct) out.url = direct;
+    },
+    'bg-green-500', 800, 2
+  ));
+
+  manager.addSite(new Site(
+    '7MMTV',
+    (id) => `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(numericOnly(id))}&search_type=searchall&op=search`,
+    (res, id, out) => {
+      const html = res.responseText;
+      const cleanNum = numericOnly(id);
+      const marker = `搜索 "${cleanNum}" (`;
+      const idx = html.indexOf(marker);
+      if (idx !== -1) {
+        const count = parseInt(html.slice(idx + marker.length, idx + marker.length + 10), 10);
+        if (count > 0) {
+          out.url = `https://7mmtv.sx/zh/searchform_search/all/index.html?search_keyword=${encodeURIComponent(cleanNum)}`;
+          return;
+        }
+      }
+      const direct = fastFindDirectLink(html, '7mmtv.sx', id);
+      if (direct) out.url = direct;
+    },
+    'bg-red-500', 800, 2
+  ));
+
+  manager.addSite(new Site(
+    'JAVFC2',
+    (id) => `https://javfc2.xyz/?s=${numericOnly(id)}`,
+    (res, id, out) => {
+      const html = res.responseText;
+      const direct = fastFindDirectLink(html, 'javfc2.xyz', id);
+      if (direct) {
+        out.url = direct;
+        return;
+      }
+      if (
+        html.includes('Nothing found') ||
+        html.includes('No results') ||
+        html.includes('not-found')
+      ) {
+        return;
+      }
+      out.url = `https://javfc2.xyz/?s=${numericOnly(id)}`;
+    },
+    'bg-purple-500', 800, 2
+  ));
+
+  manager.addSite(new Site(
+    'Sukebei',
+    (id) => `https://sukebei.nyaa.si/?page=rss&q=${encodeURIComponent(numericOnly(id))}&c=0_0&f=0`,
+    (res, id, out) => {
+      if (res.responseText.includes('<item')) {
+        out.url = `https://sukebei.nyaa.si/?f=0&c=0_0&q=${encodeURIComponent(numericOnly(id))}&s=seeders&o=desc`;
+      }
+    },
+    'bg-yellow-500', 1500, 1
+  ));
+
+  manager.addSite(new Site(
+    'SupJav',
+    (id) => `https://supjav.com/?s=${numericOnly(id)}`,
+    (res, id, out) => {
+      const cleanId = cleanAlnum(id);
+      if (res.finalUrl && !res.finalUrl.includes('?s=') && cleanAlnum(res.finalUrl).includes(cleanId)) {
+        out.url = res.finalUrl;
+        return;
+      }
+      const html = res.responseText;
+      const direct = fastFindDirectLink(html, 'supjav.com', id);
+      if (direct) {
+        out.url = direct;
+        return;
+      }
+      const m = RE_SUPJAV_COUNT.exec(html);
+      if (m && parseInt(m[1], 10) > 0) {
+        out.url = `https://supjav.com/?s=${numericOnly(id)}`;
+      }
+    },
+    'bg-orange-500', 1200, 1
+  ));
+
+  // ─────────────────────────────────────────────
+  // Bootstrap
+  // ─────────────────────────────────────────────
+  const floatingMenu = new FloatingMenu('搜尋開關');
+
+  (async () => {
+    await Promise.all([
+      CacheStore.init(),
+      manager.refreshActiveSites()
+    ]);
+
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < manager.sites.length; i++) {
+      const site = manager.sites[i];
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = `checkbox_${site.name}`;
+      cb.checked = site.enabled;
+      cb.addEventListener('change', () => {
+        GM.setValue(`site_${site.name}`, cb.checked).catch(() => {});
+        manager.toggleSite(site, cb.checked);
+      });
+
+      const label = document.createElement('label');
+      label.textContent = site.name;
+      label.htmlFor = `checkbox_${site.name}`;
+
+      const row = document.createElement('div');
+      row.className = 'menu-item';
+      row.appendChild(cb);
+      row.appendChild(label);
+      row.addEventListener('click', (e) => {
+        if (e.target !== cb) cb.click();
+      });
+      frag.appendChild(row);
+    }
+
+    floatingMenu.addContent(frag);
+    manager.start();
+  })();
+})();
+
